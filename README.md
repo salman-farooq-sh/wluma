@@ -58,7 +58,7 @@ Then simply run `make build`.
 
 In order to access backlight devices, `wluma` must either:
 
-- have direct driver access: install the supplied `90-wluma-backlight.rules` udev rule, add your user to the `video` group and reboot (fastest)
+- have direct driver access: install the supplied `90-wluma-backlight.rules` udev rule, add your user to the `video` group and reboot (fastest, most likely a requirement for smooth transitions)
 - run on a system that uses `elogind` or `systemd-logind` (they provide a safe interface for unprivileged users to control device's brightness through `dbus`, no configuration necessary)
 - run as `root` (not recommended)
 
@@ -74,7 +74,7 @@ Each of them contains a `thresholds` field, which comes with good default values
 
 ### Displays
 
-Multiple outputs are supported, using `backlight` (common for internal laptop screens) and `ddcutil` (for external screens).
+Multiple outputs are supported, using `backlight` (common for internal laptop screens) and `ddcutil` (for external screens). DDC is known to often be problematic, always consider trying out [ddcci-driver-linux](https://gitlab.com/ddcci-driver-linux/ddcci-driver-linux) first if you can.
 
 Each output is identified by compositor using model, manufacturer and serial number (e.g.`eDP-1 'Sharp Corporation 0x14A8 0x00000000' (eDP-1)`.
 
@@ -138,7 +138,6 @@ For more complex selectors, see [env_logger's documentation](https://docs.rs/env
 Help is wanted and much appreciated! If you want to implement some of these, feel free to open an issue and I'll provide more details and try to help you along the way.
 
 - Support for frames with custom DRM modifiers (e.g. multi-planar frames) is currently not implemented. This was [implemented in mesa](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/1466) and can finally be added to `wluma`. Until then, a workaround is to export `WLR_DRM_NO_MODIFIERS=1` before launching your wlroots-based compositor.
-- Changing screen resolution while `wluma` is running is not supported yet, and should crash the app. Workaround: restart `wluma` after changing resolution.
 - Plugging in a screen while `wluma` is running. Workaround: restart `wluma`.
 
 ## Relevant projects
