@@ -333,12 +333,10 @@ impl Dispatch<WlRegistry, GlobalsContext> for Capturer {
                 };
             }
 
-            Event::GlobalRemove { name } => {
-                if Some(name) == state.output_global_id {
-                    log::debug!("Disconnected screen {}", ctx.desired_output);
-                    state.output = None;
-                    state.output_global_id = None;
-                }
+            Event::GlobalRemove { name } if Some(name) == state.output_global_id => {
+                log::debug!("Disconnected screen {}", ctx.desired_output);
+                state.output = None;
+                state.output_global_id = None;
             }
             _ => {}
         }
