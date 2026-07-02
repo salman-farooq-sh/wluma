@@ -1,6 +1,6 @@
+use anyhow::Result;
 use itertools::Itertools;
 use std::collections::HashMap;
-use std::error::Error;
 
 pub mod controller;
 pub mod iio;
@@ -8,8 +8,23 @@ pub mod none;
 pub mod time;
 pub mod webcam;
 
-pub trait Als {
-    fn get(&self) -> Result<String, Box<dyn Error>>;
+#[allow(clippy::large_enum_variant)]
+pub enum Als {
+    Webcam(webcam::Als),
+    Iio(iio::Als),
+    Time(time::Als),
+    None(none::Als),
+}
+
+impl Als {
+    pub async fn get(&self) -> Result<String> {
+        match self {
+            Als::Webcam(als) => als.get().await,
+            Als::Iio(als) => als.get().await,
+            Als::Time(als) => als.get().await,
+            Als::None(als) => als.get().await,
+        }
+    }
 }
 
 fn find_profile(raw: u64, thresholds: &HashMap<u64, String>) -> String {

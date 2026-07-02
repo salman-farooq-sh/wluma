@@ -41,10 +41,13 @@ The app has minimal impact on system resources and battery life even though it i
 
 Use one of the available packages and methods below:
 
-- Alpine Linux: [wluma](https://pkgs.alpinelinux.org/packages?name=wluma) (from Alpine Edge; it will be available in stable branches since Alpine v3.16)
+- Alpine Linux: [wluma](https://pkgs.alpinelinux.org/packages?name=wluma)
 - Arch Linux: [wluma](https://aur.archlinux.org/packages/wluma/) or [wluma-git](https://aur.archlinux.org/packages/wluma-git/)
 - NixOS: [wluma](https://search.nixos.org/packages?channel=unstable&show=wluma&from=0&size=50&sort=relevance&type=packages&query=wluma)
-- Build the app yourself using the instructions below and install it via `sudo make install`
+- Fedora Linux: [wluma](https://github.com/terrapkg/packages/tree/frawhide/anda/system/wluma) via the [Terra repository](https://terra.fyralabs.com/)
+- Build the app yourself using the instructions below and copy the resulting binary somewhere in your `$PATH`.
+  - optionally, grab the `wluma.service` if you want to run it as a systemd-service - it can be placed e.g. in `~/.config/systemd/user/`.
+  - you might need `90-wluma-backlight.rules` too, if you want to give `wluma` direct driver access for the fastest performance (see "Permissions" section below) - it can be placed e.g. in `/etc/udev/rules.d/`.
 
 ## Build
 
@@ -52,7 +55,7 @@ Use one of the available packages and methods below:
 
 If you want to build the app yourself, make sure you use latest stable Rust, otherwise you might get compilation errors! Using `rustup` is perhaps the easiest. Ubuntu needs the following dependencies: `sudo apt-get -y install v4l-utils libv4l-dev libudev-dev libvulkan-dev libdbus-1-dev`.
 
-Then simply run `make build`.
+Then simply run `cargo build --locked --release` and the binary will be placed into `./target/release/wluma`.
 
 ## Permissions
 
@@ -76,11 +79,11 @@ Each of them contains a `thresholds` field, which comes with good default values
 
 Multiple outputs are supported, using `backlight` (common for internal laptop screens) and `ddcutil` (for external screens). DDC is known to often be problematic, always consider trying out [ddcci-driver-linux](https://gitlab.com/ddcci-driver-linux/ddcci-driver-linux) first if you can.
 
-Each output is identified by compositor using model, manufacturer and serial number (e.g.`eDP-1 'Sharp Corporation 0x14A8 0x00000000' (eDP-1)`.
+The `name` field in the output config identifies the Wayland output, and is matched as a substring against descriptions containing model, manufacturer and serial number (like `eDP-1 'Sharp Corporation 0x14A8 0x00000000' (eDP-1)`), so you are free to put simply `eDP-1`, `HDMI-A-3`, or a unique model/serial substring. It is your responsibility to make sure that the values you use match **uniquely** to one output only.
 
-The `name` field in the output config will be matched as a substring, so you are free to put simply `eDP-1`, or a serial number (if you have two identical external screens). It is your responsibility to make sure that the values you use match **uniquely** to one output only.
+For `output.ddcutil`, if the identifier that works for brightness control is not the same substring that your Wayland compositor exposes for screen capture, set `identifier`. This is common for external DDC monitors: `name` should match the compositor output description such as `HDMI-A-3` or `LG ULTRAWIDE`, while `identifier` may need to be a serial number for DDC.
 
-_Tip:_ run `wluma` with `RUST_LOG=debug` to see how your outputs are being identified, so that you can choose an appropriate `name` configuration value.
+_Tip:_ run `wluma` with `RUST_LOG=debug` to see how your outputs are being identified, so that you can choose an appropriate `name` and `identifier` configuration values.
 
 The `capturer` field will determine how screen contents will be captured. Currently supported values are `wayland` (works only on Wayland compositors that support protocols listed in the top) and `none` (ignores screen contents and predicts brightness only based on ALS). The value `wayland` will automatically choose the most appropriate protocol, but if you want to force a specific one, you can also use `ext-image-capture-source-v1`, `wlr-screencopy-unstable-v1` or `wlr-export-dmabuf-unstable-v1` as the value.
 
@@ -132,6 +135,28 @@ To run the app, simply launch `wluma` or use the provided systemd user service.
 To enable logging, set environment variable `RUST_LOG` to one of these values: `error`, `warn`, `info`, `debug`, `trace`.
 
 For more complex selectors, see [env_logger's documentation](https://docs.rs/env_logger/latest/env_logger/#enabling-logging).
+
+## Validating that wluma is able to see screen contents correctly
+
+This is a useful test to validate that wluma does indeed see the screen contents correctly. This is obviously only applicable if you didn't disable `capturer` in your config.
+
+1. Stop any running `wluma` instances
+1. Run the latest code from `main` branch (unless another branch was given to you by the maintainers): `RUST_LOG=trace cargo run`
+1. Open https://deadpixeltest.org/ and start the test.
+1. Make sure that **the entire screen** is covered with a single solid color, nothing else should be visible - not a status bar nor a notification, nothing else.
+1. Repeat for each of these colors: `black`, `white`, `red`, `green`, `blue`:
+   1. Let the color be visible for a few seconds.
+   1. Quickly go back to the running `wluma` and check the `luma` value reported for that color: `Prediction: 252 (lux: none, luma: ---> 14 <---)`
+1. Compare your values with the following expected results:
+   ```
+   black: 0
+   white: 100
+   red: 49
+   green: 83
+   blue: 26
+   ```
+
+If your results do not match, please open an issue and let's investigate!
 
 ## Known issues (help wanted!)
 

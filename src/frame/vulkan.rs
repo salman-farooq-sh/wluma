@@ -1,14 +1,14 @@
 use crate::frame::compute_perceived_lightness_percent;
 use crate::frame::object::Object;
+use anyhow::{anyhow, Result};
 use ash::khr::external_memory_fd::Device as KHRDevice;
 use ash::{vk, Device, Entry, Instance};
+use drm_fourcc::DrmFourcc;
 use std::default::Default;
-use std::error::Error;
 use std::ffi::CString;
 use std::ops::Drop;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-const WLUMA_VERSION: u32 = vk::make_api_version(0, 4, 6, 0);
 const VULKAN_VERSION: u32 = vk::make_api_version(0, 1, 2, 0);
 
 const FINAL_MIP_LEVEL: u32 = 4; // Don't generate mipmaps beyond this level - GPU is doing too poor of a job averaging the colors
@@ -35,13 +35,20 @@ pub struct Vulkan {
 }
 
 impl Vulkan {
-    pub fn new() -> Result<Self, Box<dyn Error>> {
+    pub fn new() -> Result<Self> {
         let app_name = CString::new("wluma")?;
+        let app_version: u32 = vk::make_api_version(
+            0,
+            env!("WLUMA_VERSION_MAJOR").parse()?,
+            env!("WLUMA_VERSION_MINOR").parse()?,
+            env!("WLUMA_VERSION_PATCH").parse()?,
+        );
+
         let app_info = vk::ApplicationInfo::default()
             .application_name(&app_name)
-            .application_version(WLUMA_VERSION)
+            .application_version(app_version)
             .engine_name(&app_name)
-            .engine_version(WLUMA_VERSION)
+            .engine_version(app_version)
             .api_version(VULKAN_VERSION);
 
         let instance_extensions = &[
@@ -68,7 +75,7 @@ impl Vulkan {
         };
         let physical_device = *physical_devices
             .first()
-            .ok_or("Unable to find a physical device")?;
+            .ok_or(anyhow!("Unable to find a physical device"))?;
 
         let queue_family_index = 0;
         let queue_info = &[vk::DeviceQueueCreateInfo::default()
@@ -145,7 +152,7 @@ impl Vulkan {
         })
     }
 
-    pub fn luma_percent_from_external_fd(&mut self, frame: &Object) -> Result<u8, Box<dyn Error>> {
+    pub fn luma_percent_from_external_fd(&mut self, frame: &Object) -> Result<u8> {
         let (frame_image, frame_image_memory) = self.init_frame_image(frame)?;
 
         let result = self.luma_percent(&frame_image)?;
@@ -158,7 +165,7 @@ impl Vulkan {
         Ok(result)
     }
 
-    pub fn luma_percent_from_internal_fd(&mut self) -> Result<u8, Box<dyn Error>> {
+    pub fn luma_percent_from_internal_fd(&mut self) -> Result<u8> {
         let frame_image = self.exportable_frame_image.unwrap();
 
         let result = self.luma_percent(&frame_image)?;
@@ -166,9 +173,13 @@ impl Vulkan {
         Ok(result)
     }
 
-    fn luma_percent(&self, frame_image: &vk::Image) -> Result<u8, Box<dyn Error>> {
-        let image = self.image.ok_or("Unable to borrow the Vulkan image")?;
-        let buffer_memory = self.buffer_memory.ok_or("Unable to borrow buffer memory")?;
+    fn luma_percent(&self, frame_image: &vk::Image) -> Result<u8> {
+        let image = self
+            .image
+            .ok_or(anyhow!("Unable to borrow the Vulkan image"))?;
+        let buffer_memory = self
+            .buffer_memory
+            .ok_or(anyhow!("Unable to borrow buffer memory"))?;
 
         self.begin_commands()?;
 
@@ -212,7 +223,7 @@ impl Vulkan {
         Ok(result)
     }
 
-    fn init_image(&mut self, frame: &Object) -> Result<(), Box<dyn Error>> {
+    fn init_image(&mut self, frame: &Object) -> Result<()> {
         let mip_levels = f64::max(frame.width.into(), frame.height.into())
             .log2()
             .floor() as u32;
@@ -301,7 +312,9 @@ impl Vulkan {
             &device_memory_properties,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )
-        .ok_or("Unable to find suitable memory type for the buffer")?;
+        .ok_or(anyhow!(
+            "Unable to find suitable memory type for the buffer"
+        ))?;
 
         let allocate_info = vk::MemoryAllocateInfo {
             allocation_size: buffer_memory_req.size,
@@ -338,17 +351,10 @@ impl Vulkan {
         Ok(())
     }
 
-    fn init_frame_image(
-        &mut self,
-        frame: &Object,
-    ) -> Result<(vk::Image, vk::DeviceMemory), Box<dyn Error>> {
+    fn init_frame_image(&mut self, frame: &Object) -> Result<(vk::Image, vk::DeviceMemory)> {
         assert_eq!(
             1, frame.num_objects,
             "Frames with multiple objects are not supported yet, use WLR_DRM_NO_MODIFIERS=1 as described in README and follow issue #8"
-        );
-        assert_eq!(
-            875713112, frame.format,
-            "Frame with formats other than DRM_FORMAT_XRGB8888 are not supported yet (yours is {}). If you see this issue, please open a GitHub issue (unless there's one already open) and share your format value", frame.format
         );
 
         // External memory info
@@ -359,7 +365,7 @@ impl Vulkan {
         let frame_image_create_info = vk::ImageCreateInfo::default()
             .push_next(&mut frame_image_memory_info)
             .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::B8G8R8A8_UNORM)
+            .format(map_drm_format(frame.format)?)
             .extent(vk::Extent3D {
                 width: frame.width,
                 height: frame.height,
@@ -447,18 +453,10 @@ impl Vulkan {
         Ok((frame_image, frame_image_memory))
     }
 
-    pub fn init_exportable_frame_image(
-        &mut self,
-        frame: &Object,
-    ) -> Result<(i32, u64, u64, u64), Box<dyn Error>> {
+    pub fn init_exportable_frame_image(&mut self, frame: &Object) -> Result<(i32, u64, u64, u64)> {
         assert_eq!(
             1, frame.num_objects,
             "Frames with multiple objects are not supported yet, use WLR_DRM_NO_MODIFIERS=1 as described in README and follow issue #8"
-        );
-
-        assert_eq!(
-            875713112, frame.format,
-            "Frame with formats other than DRM_FORMAT_XRGB8888 are not supported yet (yours is {}). If you see this issue, please open a GitHub issue (unless there's one already open) and share your format value", frame.format
         );
 
         let mut frame_image_memory_info = vk::ExternalMemoryImageCreateInfo::default()
@@ -467,7 +465,7 @@ impl Vulkan {
         let frame_image_create_info = vk::ImageCreateInfo::default()
             .push_next(&mut frame_image_memory_info)
             .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::B8G8R8A8_UNORM)
+            .format(map_drm_format(frame.format)?)
             .extent(vk::Extent3D {
                 width: frame.width,
                 height: frame.height,
@@ -758,7 +756,7 @@ impl Vulkan {
         mip_level: u32,
         width: u32,
         height: u32,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<()> {
         self.add_barrier(
             image,
             mip_level,
@@ -784,7 +782,7 @@ impl Vulkan {
                 depth: 1,
             });
 
-        let buffer = self.buffer.ok_or("Unable to borrow buffer")?;
+        let buffer = self.buffer.ok_or(anyhow!("Unable to borrow buffer"))?;
 
         unsafe {
             self.device.cmd_copy_image_to_buffer(
@@ -799,7 +797,7 @@ impl Vulkan {
         Ok(())
     }
 
-    fn begin_commands(&self) -> Result<(), Box<dyn Error>> {
+    fn begin_commands(&self) -> Result<()> {
         let command_buffer_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
@@ -812,7 +810,7 @@ impl Vulkan {
         Ok(())
     }
 
-    fn submit_commands(&self) -> Result<(), Box<dyn Error>> {
+    fn submit_commands(&self) -> Result<()> {
         unsafe {
             // End the command buffer
             self.device
@@ -886,4 +884,28 @@ fn find_memory_type_index(
                 && memory_type.property_flags & flags == flags
         })
         .map(|(index, _)| index as _)
+}
+
+fn map_drm_format(format: u32) -> Result<vk::Format> {
+    let drm = DrmFourcc::try_from(format)?;
+    log::debug!("Processing frame in DRM format {drm}");
+
+    match drm {
+        DrmFourcc::Rgbx4444 => Ok(vk::Format::R4G4B4A4_UNORM_PACK16),
+        DrmFourcc::Bgrx4444 => Ok(vk::Format::B4G4R4A4_UNORM_PACK16),
+        DrmFourcc::Rgb565 => Ok(vk::Format::R5G6B5_UNORM_PACK16),
+        DrmFourcc::Bgr565 => Ok(vk::Format::B5G6R5_UNORM_PACK16),
+        DrmFourcc::Xrgb1555 => Ok(vk::Format::A1R5G5B5_UNORM_PACK16),
+        DrmFourcc::Rgbx5551 => Ok(vk::Format::R5G5B5A1_UNORM_PACK16),
+        DrmFourcc::Bgrx5551 => Ok(vk::Format::B5G5R5A1_UNORM_PACK16),
+        DrmFourcc::Xrgb2101010 => Ok(vk::Format::A2R10G10B10_UNORM_PACK32),
+        DrmFourcc::Xbgr2101010 => Ok(vk::Format::A2B10G10R10_UNORM_PACK32),
+        DrmFourcc::Xbgr16161616f => Ok(vk::Format::R16G16B16A16_SFLOAT),
+        DrmFourcc::Xbgr8888 => Ok(vk::Format::R8G8B8A8_UNORM),
+        DrmFourcc::Bgrx8888 => Ok(vk::Format::B8G8R8_UNORM),
+        DrmFourcc::Xrgb8888 => Ok(vk::Format::B8G8R8A8_UNORM),
+        _ => Err(anyhow!(
+            "Unsupported DRM format: {format}. Please report on GitHub."
+        )),
+    }
 }
