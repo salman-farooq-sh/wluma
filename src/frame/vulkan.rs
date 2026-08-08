@@ -5,7 +5,7 @@ use ash::khr::external_memory_fd::Device as KHRDevice;
 use ash::{vk, Device, Entry, Instance};
 use drm_fourcc::DrmFourcc;
 use std::default::Default;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::ops::Drop;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -20,6 +20,7 @@ pub struct Vulkan {
     device: Device,
     physical_device: vk::PhysicalDevice,
     khr_device: KHRDevice,
+    supports_drm_modifier: bool,
     buffer: Option<vk::Buffer>,
     buffer_memory: Option<vk::DeviceMemory>,
     command_pool: vk::CommandPool,
@@ -82,15 +83,28 @@ impl Vulkan {
             .queue_family_index(queue_family_index)
             .queue_priorities(&[1.0])];
 
-        let device_extensions = &[
+        let mut device_extensions = vec![
             vk::KHR_EXTERNAL_MEMORY_FD_NAME.as_ptr(),
             vk::EXT_EXTERNAL_MEMORY_DMA_BUF_NAME.as_ptr(),
         ];
+        let supports_drm_modifier = unsafe {
+            instance
+                .enumerate_device_extension_properties(physical_device)
+                .map_err(anyhow::Error::msg)?
+                .iter()
+                .any(|extension| {
+                    CStr::from_ptr(extension.extension_name.as_ptr())
+                        == vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME
+                })
+        };
+        if supports_drm_modifier {
+            device_extensions.push(vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME.as_ptr());
+        }
         let features = vk::PhysicalDeviceFeatures::default();
 
         let device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(queue_info)
-            .enabled_extension_names(device_extensions)
+            .enabled_extension_names(&device_extensions)
             .enabled_features(&features);
 
         let device = unsafe {
@@ -137,6 +151,7 @@ impl Vulkan {
             physical_device,
             device,
             khr_device,
+            supports_drm_modifier,
             command_pool,
             command_buffers,
             queue,
@@ -352,6 +367,11 @@ impl Vulkan {
     }
 
     fn init_frame_image(&mut self, frame: &Object) -> Result<(vk::Image, vk::DeviceMemory)> {
+        if frame.layout.is_some() && !self.supports_drm_modifier {
+            return Err(anyhow!(
+                "Vulkan device does not support DRM format modifiers"
+            ));
+        }
         assert_eq!(
             1, frame.num_objects,
             "Frames with multiple objects are not supported yet, use WLR_DRM_NO_MODIFIERS=1 as described in README and follow issue #8"
@@ -360,9 +380,20 @@ impl Vulkan {
         // External memory info
         let mut frame_image_memory_info = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let (modifier, offset, stride) = frame.layout.unwrap_or_default();
+        let plane_layouts = [vk::SubresourceLayout {
+            offset: offset as u64,
+            size: frame.sizes[0] as u64,
+            row_pitch: stride as u64,
+            array_pitch: 0,
+            depth_pitch: 0,
+        }];
+        let mut modifier_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .plane_layouts(&plane_layouts);
 
         // Image create info
-        let frame_image_create_info = vk::ImageCreateInfo::default()
+        let mut frame_image_create_info = vk::ImageCreateInfo::default()
             .push_next(&mut frame_image_memory_info)
             .image_type(vk::ImageType::TYPE_2D)
             .format(map_drm_format(frame.format)?)
@@ -373,11 +404,18 @@ impl Vulkan {
             })
             .mip_levels(1)
             .array_layers(1)
-            .tiling(vk::ImageTiling::LINEAR)
+            .tiling(if frame.layout.is_some() {
+                vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT
+            } else {
+                vk::ImageTiling::LINEAR
+            })
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .samples(vk::SampleCountFlags::TYPE_1)
             .usage(vk::ImageUsageFlags::TRANSFER_SRC)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        if frame.layout.is_some() {
+            frame_image_create_info = frame_image_create_info.push_next(&mut modifier_info);
+        }
 
         let frame_image = unsafe {
             self.device

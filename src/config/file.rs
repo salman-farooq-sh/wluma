@@ -14,6 +14,8 @@ pub enum Capturer {
     WlrScreencopyUnstableV1,
     #[serde(rename = "ext-image-copy-capture-v1")]
     ExtImageCopyCaptureV1,
+    #[serde(rename = "pipewire")]
+    Pipewire,
     #[serde(rename = "none")]
     None,
 }

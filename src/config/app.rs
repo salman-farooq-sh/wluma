@@ -23,6 +23,7 @@ impl fmt::Display for WaylandProtocol {
 #[derive(Debug, Clone)]
 pub enum Capturer {
     Wayland(WaylandProtocol),
+    Pipewire,
     None,
 }
 

@@ -16,6 +16,7 @@
           v4l-utils
           vulkan-loader
           dbus
+          pipewire
         ];
       in
       {

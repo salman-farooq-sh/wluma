@@ -5,6 +5,7 @@ pub struct Object {
     pub height: u32,
     pub num_objects: u32,
     pub format: u32,
+    pub layout: Option<(u64, u32, u32)>,
     pub fds: Vec<RawFd>,
     pub sizes: Vec<u32>,
 }
@@ -16,6 +17,7 @@ impl Object {
             height,
             num_objects,
             format,
+            layout: None,
             fds: vec![0; num_objects as usize],
             sizes: vec![0; num_objects as usize],
         }

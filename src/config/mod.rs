@@ -39,6 +39,7 @@ fn match_capturer(capturer: file::Capturer) -> app::Capturer {
             app::Capturer::Wayland(app::WaylandProtocol::Any)
         }
         file::Capturer::Wayland => app::Capturer::Wayland(app::WaylandProtocol::Any),
+        file::Capturer::Pipewire => app::Capturer::Pipewire,
         file::Capturer::ExtImageCopyCaptureV1 => {
             app::Capturer::Wayland(app::WaylandProtocol::ExtImageCopyCaptureV1)
         }
@@ -171,6 +172,28 @@ thresholds = { 0 = "night" }
         match config.als {
             app::Als::Iio { path, .. } => {
                 assert_eq!(path.as_deref(), Some("/sys/bus/iio/devices"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_pipewire_capturer() {
+        let config = parse_config_str(
+            r#"
+[als.none]
+
+[[output.backlight]]
+name = "panel"
+path = "/sys/class/backlight/panel"
+capturer = "pipewire"
+"#,
+        )
+        .unwrap();
+
+        match &config.output[0] {
+            app::Output::Backlight(output) => {
+                assert!(matches!(output.capturer, app::Capturer::Pipewire));
             }
             _ => unreachable!(),
         }

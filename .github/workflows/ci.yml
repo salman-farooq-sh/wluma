@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v3
       - uses: taiki-e/install-action@just
       - run: sudo apt-get update
-      - run: sudo apt-get -y install v4l-utils libv4l-dev libudev-dev libvulkan-dev libdbus-1-dev
+      - run: sudo apt-get -y install v4l-utils libv4l-dev libudev-dev libvulkan-dev libdbus-1-dev libpipewire-0.3-dev
       - run: WLUMA_VERSION=0.0.0-ci just test
 
   lint:
@@ -23,5 +23,5 @@ jobs:
       - uses: actions/checkout@v3
       - uses: taiki-e/install-action@just
       - run: sudo apt-get update
-      - run: sudo apt-get -y install v4l-utils libv4l-dev libudev-dev libvulkan-dev libdbus-1-dev
+      - run: sudo apt-get -y install v4l-utils libv4l-dev libudev-dev libvulkan-dev libdbus-1-dev libpipewire-0.3-dev
       - run: WLUMA_VERSION=0.0.0-ci just lint

@@ -4,16 +4,17 @@ A tool for Wayland compositors to automatically adjust screen brightness based o
 
 ## Supported screen capture protocols
 
-With default config, `wluma` will automatically detect which protocols are supported, and pick the most appropriate one. See "Configuration" section below for more information and how to force a specific protocol.
+With the default `capturer = "wayland"`, `wluma` will automatically detect supported Wayland protocols and pick the most appropriate one. PipeWire capture must be selected explicitly. See the "Configuration" section below for details.
 
 The list of supported protocols:
 
-- `ext-image-capture-source-v1` - the newest protocol that potentially is (or will be) supported by any modern Wayland desktop environment.
+- `ext-image-copy-capture-v1` - the newest protocol that potentially is (or will be) supported by any modern Wayland desktop environment.
   - At the time of writing, it's not supported by any compositor yet.
-  - requires `ext-image-capture-source-v1` and `linux-dmabuf-v1` protocol to be supported as well.
+  - requires `ext-image-capture-source-v1` and `linux-dmabuf-v1` protocols to be supported as well.
 - `wlr-screencopy-unstable-v1` - supported by any `wlroots`-based compositors (e.g. `sway`), as well as Hyprland.
   - requires `linux-dmabuf-v1` protocol to be supported as well.
 - `wlr-export-dmabuf-unstable-v1` - supported by any `wlroots`-based compositors (e.g. `sway`).
+- PipeWire streams provided directly by KDE Plasma or GNOME Mutter. Select these with `capturer = "pipewire"`.
 
 ## Idea
 
@@ -31,7 +32,7 @@ Simply launch `wluma` and continue adjusting your screen brightness as you usual
 
 ## Performance
 
-The app has minimal impact on system resources and battery life even though it is able to monitor screen contents several times a second. This is achieved by using Wayland protocols to get access to the screen contents and doing computations entirely on GPU using Vulkan API.
+The app has minimal impact on system resources and battery life even though it is able to monitor screen contents several times a second. This is achieved by importing DMA-BUF screen buffers and doing computations on GPU using Vulkan API.
 
 ## Installation
 
@@ -53,7 +54,7 @@ Use one of the available packages and methods below:
 
 [![CI](https://github.com/maximbaz/wluma/actions/workflows/ci.yml/badge.svg)](https://github.com/maximbaz/wluma/actions/workflows/ci.yml)
 
-If you want to build the app yourself, make sure you use latest stable Rust, otherwise you might get compilation errors! Using `rustup` is perhaps the easiest. Ubuntu needs the following dependencies: `sudo apt-get -y install v4l-utils libv4l-dev libudev-dev libvulkan-dev libdbus-1-dev`.
+If you want to build the app yourself, make sure you use latest stable Rust, otherwise you might get compilation errors! Using `rustup` is perhaps the easiest. Ubuntu needs the following dependencies: `sudo apt-get -y install v4l-utils libv4l-dev libudev-dev libvulkan-dev libdbus-1-dev libpipewire-0.3-dev`.
 
 Then simply run `cargo build --locked --release` and the binary will be placed into `./target/release/wluma`.
 
@@ -95,7 +96,7 @@ For `output.ddcutil`, if the identifier that works for brightness control is not
 
 _Tip:_ run `wluma` with `RUST_LOG=debug` to see how your outputs are being identified, so that you can choose an appropriate `name` and `identifier` configuration values.
 
-The `capturer` field will determine how screen contents will be captured. Currently supported values are `wayland` (works only on Wayland compositors that support protocols listed in the top) and `none` (ignores screen contents and predicts brightness only based on ALS). The value `wayland` will automatically choose the most appropriate protocol, but if you want to force a specific one, you can also use `ext-image-capture-source-v1`, `wlr-screencopy-unstable-v1` or `wlr-export-dmabuf-unstable-v1` as the value.
+The `capturer` field will determine how screen contents will be captured. Currently supported values are `wayland` (works only on Wayland compositors that support protocols listed in the top), `pipewire` (uses KDE's or GNOME Mutter's private compositor API without creating a portal recording session) and `none` (ignores screen contents and predicts brightness only based on ALS). The value `wayland` will automatically choose the most appropriate protocol, but if you want to force a specific one, you can also use `ext-image-copy-capture-v1`, `wlr-screencopy-unstable-v1` or `wlr-export-dmabuf-unstable-v1` as the value.
 
 _Tip:_ run `wluma` with `RUST_LOG=debug` and `capturer="wayland"` to see which protocols are supported by your Wayland compositor, and which one `wluma` chooses to use.
 
