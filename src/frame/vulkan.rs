@@ -1,9 +1,12 @@
 use crate::frame::compute_perceived_lightness_percent;
 use crate::frame::object::Object;
 use anyhow::{anyhow, Result};
+use ash::ext::image_drm_format_modifier::Device as DrmModifierDevice;
 use ash::khr::external_memory_fd::Device as KHRDevice;
 use ash::{vk, Device, Entry, Instance};
 use drm_fourcc::DrmFourcc;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::default::Default;
 use std::ffi::{CStr, CString};
 use std::ops::Drop;
@@ -20,7 +23,9 @@ pub struct Vulkan {
     device: Device,
     physical_device: vk::PhysicalDevice,
     khr_device: KHRDevice,
+    drm_modifier_device: Option<DrmModifierDevice>,
     supports_drm_modifier: bool,
+    modifier_cache: RefCell<HashMap<(u32, u32), Vec<u64>>>,
     buffer: Option<vk::Buffer>,
     buffer_memory: Option<vk::DeviceMemory>,
     command_pool: vk::CommandPool,
@@ -74,11 +79,34 @@ impl Vulkan {
                 .enumerate_physical_devices()
                 .map_err(anyhow::Error::msg)?
         };
+        for (index, physical_device) in physical_devices.iter().enumerate() {
+            let properties = unsafe { instance.get_physical_device_properties(*physical_device) };
+            let name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }.to_string_lossy();
+            log::debug!(
+                "Discovered Vulkan device {index}: '{name}', type={}, API {}.{}.{}, driver version {}",
+                properties.device_type.as_raw(),
+                vk::api_version_major(properties.api_version),
+                vk::api_version_minor(properties.api_version),
+                vk::api_version_patch(properties.api_version),
+                properties.driver_version,
+            );
+        }
         let physical_device = *physical_devices
             .first()
             .ok_or(anyhow!("Unable to find a physical device"))?;
+        let physical_device_properties =
+            unsafe { instance.get_physical_device_properties(physical_device) };
+        let physical_device_name =
+            unsafe { CStr::from_ptr(physical_device_properties.device_name.as_ptr()) }
+                .to_string_lossy();
 
-        let queue_family_index = 0;
+        let queue_family_index =
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
+                .iter()
+                .position(|properties| properties.queue_flags.contains(vk::QueueFlags::TRANSFER))
+                .ok_or(anyhow!(
+                    "Vulkan device has no transfer-capable queue family"
+                ))? as u32;
         let queue_info = &[vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
             .queue_priorities(&[1.0])];
@@ -100,6 +128,14 @@ impl Vulkan {
         if supports_drm_modifier {
             device_extensions.push(vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME.as_ptr());
         }
+        log::debug!(
+            "Using Vulkan device '{physical_device_name}', API {}.{}.{}, driver version {}, transfer queue family {}, DRM modifier extension={supports_drm_modifier}",
+            vk::api_version_major(physical_device_properties.api_version),
+            vk::api_version_minor(physical_device_properties.api_version),
+            vk::api_version_patch(physical_device_properties.api_version),
+            physical_device_properties.driver_version,
+            queue_family_index,
+        );
         let features = vk::PhysicalDeviceFeatures::default();
 
         let device_create_info = vk::DeviceCreateInfo::default()
@@ -114,6 +150,8 @@ impl Vulkan {
         };
 
         let khr_device = KHRDevice::new(&instance, &device);
+        let drm_modifier_device =
+            supports_drm_modifier.then(|| DrmModifierDevice::new(&instance, &device));
 
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
@@ -151,7 +189,9 @@ impl Vulkan {
             physical_device,
             device,
             khr_device,
+            drm_modifier_device,
             supports_drm_modifier,
+            modifier_cache: RefCell::new(HashMap::new()),
             command_pool,
             command_buffers,
             queue,
@@ -165,6 +205,143 @@ impl Vulkan {
             exportable_frame_image_memory: None,
             exportable_frame_image_fd: None,
         })
+    }
+
+    pub fn importable_modifiers(&self, format: u32) -> Result<Vec<u64>> {
+        self.dma_buf_modifiers(format, vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+    }
+
+    pub fn exportable_modifiers(&self, format: u32) -> Result<Vec<u64>> {
+        self.dma_buf_modifiers(format, vk::ExternalMemoryFeatureFlags::EXPORTABLE)
+    }
+
+    fn dma_buf_modifiers(
+        &self,
+        format: u32,
+        required_external_feature: vk::ExternalMemoryFeatureFlags,
+    ) -> Result<Vec<u64>> {
+        let cache_key = (format, required_external_feature.as_raw());
+        if let Some(modifiers) = self.modifier_cache.borrow().get(&cache_key) {
+            return Ok(modifiers.clone());
+        }
+        if !self.supports_drm_modifier {
+            self.modifier_cache
+                .borrow_mut()
+                .insert(cache_key, Vec::new());
+            return Ok(Vec::new());
+        }
+
+        let drm_format = DrmFourcc::try_from(format)?;
+        log::debug!(
+            "Querying Vulkan DMA-BUF modifiers for DRM format {drm_format}, required_external_feature={:#x}",
+            required_external_feature.as_raw(),
+        );
+        let format = map_drm_format(format)?;
+        let mut modifier_list = vk::DrmFormatModifierPropertiesListEXT::default();
+        let mut format_properties = vk::FormatProperties2::default().push_next(&mut modifier_list);
+        unsafe {
+            self.instance.get_physical_device_format_properties2(
+                self.physical_device,
+                format,
+                &mut format_properties,
+            );
+        }
+
+        let mut modifiers = vec![
+            vk::DrmFormatModifierPropertiesEXT::default();
+            modifier_list.drm_format_modifier_count as usize
+        ];
+        let mut modifier_list = vk::DrmFormatModifierPropertiesListEXT::default()
+            .drm_format_modifier_properties(&mut modifiers);
+        let mut format_properties = vk::FormatProperties2::default().push_next(&mut modifier_list);
+        unsafe {
+            self.instance.get_physical_device_format_properties2(
+                self.physical_device,
+                format,
+                &mut format_properties,
+            );
+        }
+
+        let required_format_features = vk::FormatFeatureFlags::TRANSFER_SRC
+            | vk::FormatFeatureFlags::BLIT_SRC
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+        let mut supported = Vec::new();
+        for modifier in modifiers {
+            if self.supports_dma_buf_modifier(
+                format,
+                &modifier,
+                required_format_features,
+                required_external_feature,
+            ) {
+                supported.push(modifier.drm_format_modifier);
+            }
+        }
+        log::debug!(
+            "Vulkan supported DMA-BUF modifiers: DRM format={drm_format}, Vulkan format={}, required_external_feature={:#x}, modifiers={supported:#x?}",
+            format.as_raw(),
+            required_external_feature.as_raw(),
+        );
+        self.modifier_cache
+            .borrow_mut()
+            .insert(cache_key, supported.clone());
+        Ok(supported)
+    }
+
+    fn supports_dma_buf_modifier(
+        &self,
+        format: vk::Format,
+        modifier: &vk::DrmFormatModifierPropertiesEXT,
+        required_format_features: vk::FormatFeatureFlags,
+        required_external_feature: vk::ExternalMemoryFeatureFlags,
+    ) -> bool {
+        let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+            .drm_format_modifier(modifier.drm_format_modifier)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let format_info = vk::PhysicalDeviceImageFormatInfo2::default()
+            .push_next(&mut external_info)
+            .push_next(&mut modifier_info)
+            .format(format)
+            .ty(vk::ImageType::TYPE_2D)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::TRANSFER_SRC);
+        let mut external_properties = vk::ExternalImageFormatProperties::default();
+        let mut format_properties =
+            vk::ImageFormatProperties2::default().push_next(&mut external_properties);
+
+        let result = unsafe {
+            self.instance.get_physical_device_image_format_properties2(
+                self.physical_device,
+                &format_info,
+                &mut format_properties,
+            )
+        };
+        let properties = external_properties.external_memory_properties;
+        let supported = result.is_ok()
+            && modifier.drm_format_modifier_plane_count == 1
+            && modifier
+                .drm_format_modifier_tiling_features
+                .contains(required_format_features)
+            && properties
+                .external_memory_features
+                .contains(required_external_feature)
+            && properties
+                .compatible_handle_types
+                .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        log::debug!(
+            "Vulkan DMA-BUF modifier capability: Vulkan format={}, modifier={:#018x}, planes={}, tiling_features={:#x}, required_tiling_features={:#x}, query={result:?}, external_memory_features={:#x}, required_external_feature={:#x}, compatible_handle_types={:#x}, export_from_imported_handle_types={:#x}, supported={supported}",
+            format.as_raw(),
+            modifier.drm_format_modifier,
+            modifier.drm_format_modifier_plane_count,
+            modifier.drm_format_modifier_tiling_features.as_raw(),
+            required_format_features.as_raw(),
+            properties.external_memory_features.as_raw(),
+            required_external_feature.as_raw(),
+            properties.compatible_handle_types.as_raw(),
+            properties.export_from_imported_handle_types.as_raw(),
+        );
+        supported
     }
 
     pub fn luma_percent_from_external_fd(&mut self, frame: &Object) -> Result<u8> {
@@ -381,6 +558,20 @@ impl Vulkan {
         let mut frame_image_memory_info = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
         let (modifier, offset, stride) = frame.layout.unwrap_or_default();
+        log::trace!(
+            "Importing DMA-BUF into Vulkan: DRM format={}, size={}x{}, objects={}, modifier={modifier:#018x}, offset={offset}, stride={stride}, object_size={}",
+            frame.format,
+            frame.width,
+            frame.height,
+            frame.num_objects,
+            frame.sizes[0],
+        );
+        if frame.layout.is_some() && !self.importable_modifiers(frame.format)?.contains(&modifier) {
+            return Err(anyhow!(
+                "Vulkan cannot import DRM format {} with modifier {modifier:#018x} as a transfer source",
+                frame.format
+            ));
+        }
         let plane_layouts = [vk::SubresourceLayout {
             offset: offset as u64,
             size: frame.sizes[0] as u64,
@@ -445,10 +636,10 @@ impl Vulkan {
         // We just use the first type supported (from least significant bit's side)
 
         // Find suitable memory type index
-        let memory_type_index = frame_image_mem_req
-            .memory_requirements
-            .memory_type_bits
-            .trailing_zeros();
+        let memory_type_index = memory_type_index(
+            frame_image_mem_req.memory_requirements.memory_type_bits,
+            "imported frame image",
+        )?;
 
         // Import memory app_info
         // Construct the memory alloctation info according to the requirements
@@ -467,7 +658,9 @@ impl Vulkan {
             .allocation_size(frame_image_mem_req.memory_requirements.size)
             .memory_type_index(memory_type_index);
 
-        if frame_image_mem_dedicated_req.prefers_dedicated_allocation == vk::TRUE {
+        if frame_image_mem_dedicated_req.requires_dedicated_allocation == vk::TRUE
+            || frame_image_mem_dedicated_req.prefers_dedicated_allocation == vk::TRUE
+        {
             frame_image_allocate_info =
                 frame_image_allocate_info.push_next(&mut frame_image_memory_dedicated_info);
         }
@@ -491,17 +684,37 @@ impl Vulkan {
         Ok((frame_image, frame_image_memory))
     }
 
-    pub fn init_exportable_frame_image(&mut self, frame: &Object) -> Result<(i32, u64, u64, u64)> {
+    pub fn init_exportable_frame_image(
+        &mut self,
+        frame: &Object,
+        allowed_modifiers: &[u64],
+    ) -> Result<(i32, u32, u32, u64)> {
         assert_eq!(
             1, frame.num_objects,
             "Frames with multiple objects are not supported yet, use WLR_DRM_NO_MODIFIERS=1 as described in README and follow issue #8"
         );
 
+        let supported_modifiers = self.exportable_modifiers(frame.format)?;
+        let modifiers: Vec<_> = allowed_modifiers
+            .iter()
+            .copied()
+            .filter(|modifier| supported_modifiers.contains(modifier))
+            .collect();
+        if modifiers.is_empty() {
+            return Err(anyhow!(
+                "No compositor-provided DRM modifier for format {} can be exported by Vulkan",
+                frame.format
+            ));
+        }
+
         let mut frame_image_memory_info = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mut modifier_info =
+            vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(&modifiers);
 
         let frame_image_create_info = vk::ImageCreateInfo::default()
             .push_next(&mut frame_image_memory_info)
+            .push_next(&mut modifier_info)
             .image_type(vk::ImageType::TYPE_2D)
             .format(map_drm_format(frame.format)?)
             .extent(vk::Extent3D {
@@ -511,10 +724,10 @@ impl Vulkan {
             })
             .mip_levels(1)
             .array_layers(1)
-            .tiling(vk::ImageTiling::LINEAR)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .samples(vk::SampleCountFlags::TYPE_1)
-            .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+            .usage(vk::ImageUsageFlags::TRANSFER_SRC)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
         let frame_image = unsafe {
@@ -545,10 +758,13 @@ impl Vulkan {
         // We just use the first type supported (from least significant bit's side)
 
         // Find suitable memory type index
-        let memory_type_index = frame_image_mem_req
-            .memory_requirements
-            .memory_type_bits
-            .trailing_zeros();
+        let memory_requirements = frame_image_mem_req.memory_requirements;
+        let dedicated_required =
+            frame_image_mem_dedicated_req.requires_dedicated_allocation == vk::TRUE;
+        let dedicated_preferred =
+            frame_image_mem_dedicated_req.prefers_dedicated_allocation == vk::TRUE;
+        let memory_type_index =
+            memory_type_index(memory_requirements.memory_type_bits, "exported frame image")?;
 
         // Specify that the memory can be exported
         let mut frame_import_memory_info = vk::ExportMemoryAllocateInfo::default()
@@ -561,10 +777,10 @@ impl Vulkan {
         // Allocate memory
         let mut frame_image_allocate_info = vk::MemoryAllocateInfo::default()
             .push_next(&mut frame_import_memory_info)
-            .allocation_size(frame_image_mem_req.memory_requirements.size)
+            .allocation_size(memory_requirements.size)
             .memory_type_index(memory_type_index);
 
-        if frame_image_mem_dedicated_req.prefers_dedicated_allocation == vk::TRUE {
+        if dedicated_required || dedicated_preferred {
             frame_image_allocate_info =
                 frame_image_allocate_info.push_next(&mut frame_image_memory_dedicated_info);
         }
@@ -597,7 +813,7 @@ impl Vulkan {
         };
 
         let subresource = vk::ImageSubresource::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .aspect_mask(vk::ImageAspectFlags::MEMORY_PLANE_0_EXT)
             .mip_level(0)
             .array_layer(0);
 
@@ -606,9 +822,40 @@ impl Vulkan {
                 .get_image_subresource_layout(frame_image, subresource)
         };
 
-        let offset = layout.offset;
-        let stride = layout.row_pitch;
-        let modifier: u64 = 0; // DRM_FORMAT_MOD_LINEAR
+        let offset = u32::try_from(layout.offset).map_err(|_| {
+            anyhow!(
+                "Vulkan DMA-BUF plane offset {} does not fit the Wayland protocol",
+                layout.offset
+            )
+        })?;
+        let stride = u32::try_from(layout.row_pitch).map_err(|_| {
+            anyhow!(
+                "Vulkan DMA-BUF row pitch {} does not fit the Wayland protocol",
+                layout.row_pitch
+            )
+        })?;
+        let mut modifier_properties = vk::ImageDrmFormatModifierPropertiesEXT::default();
+        unsafe {
+            self.drm_modifier_device
+                .as_ref()
+                .ok_or(anyhow!(
+                    "Vulkan device does not support DRM format modifiers"
+                ))?
+                .get_image_drm_format_modifier_properties(frame_image, &mut modifier_properties)
+                .map_err(anyhow::Error::msg)?;
+        }
+        let modifier = modifier_properties.drm_format_modifier;
+        log::debug!(
+            "Exporting Vulkan DMA-BUF: DRM format={}, size={}x{}, modifier={modifier:#018x}, memory_planes={}, offset={offset}, stride={stride}, layout_size={}, allocation_size={}, memory_type={memory_type_index}, dedicated_required={}, dedicated_preferred={}",
+            frame.format,
+            frame.width,
+            frame.height,
+            1,
+            layout.size,
+            memory_requirements.size,
+            dedicated_required,
+            dedicated_preferred,
+        );
 
         let raw_fd = fd.as_raw_fd();
 
@@ -892,6 +1139,12 @@ impl Drop for Vulkan {
             if let Some(image_memory) = self.image_memory {
                 self.device.free_memory(image_memory, None);
             }
+            if let Some(image) = self.exportable_frame_image {
+                self.device.destroy_image(image, None);
+            }
+            if let Some(image_memory) = self.exportable_frame_image_memory {
+                self.device.free_memory(image_memory, None);
+            }
 
             self.device.destroy_fence(self.fence, None);
             if let Some(buffer) = self.buffer {
@@ -906,6 +1159,14 @@ impl Drop for Vulkan {
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
+    }
+}
+
+fn memory_type_index(memory_type_bits: u32, resource: &str) -> Result<u32> {
+    if memory_type_bits == 0 {
+        Err(anyhow!("No Vulkan memory type supports the {resource}"))
+    } else {
+        Ok(memory_type_bits.trailing_zeros())
     }
 }
 
@@ -926,8 +1187,6 @@ fn find_memory_type_index(
 
 fn map_drm_format(format: u32) -> Result<vk::Format> {
     let drm = DrmFourcc::try_from(format)?;
-    log::debug!("Processing frame in DRM format {drm}");
-
     match drm {
         DrmFourcc::Rgbx4444 => Ok(vk::Format::R4G4B4A4_UNORM_PACK16),
         DrmFourcc::Bgrx4444 => Ok(vk::Format::B4G4R4A4_UNORM_PACK16),
@@ -940,7 +1199,7 @@ fn map_drm_format(format: u32) -> Result<vk::Format> {
         DrmFourcc::Xbgr2101010 => Ok(vk::Format::A2B10G10R10_UNORM_PACK32),
         DrmFourcc::Xbgr16161616f => Ok(vk::Format::R16G16B16A16_SFLOAT),
         DrmFourcc::Xbgr8888 => Ok(vk::Format::R8G8B8A8_UNORM),
-        DrmFourcc::Bgrx8888 => Ok(vk::Format::B8G8R8_UNORM),
+        DrmFourcc::Bgrx8888 => Ok(vk::Format::B8G8R8A8_UNORM),
         DrmFourcc::Xrgb8888 => Ok(vk::Format::B8G8R8A8_UNORM),
         _ => Err(anyhow!(
             "Unsupported DRM format: {format}. Please report on GitHub."

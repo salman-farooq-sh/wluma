@@ -36,6 +36,7 @@ pub struct Capturer {
     output: Option<WlOutput>,
     output_global_id: Option<u32>,
     pending_frame: Option<Object>,
+    dmabuf_formats: Vec<(u32, Vec<u64>)>,
     controller: Option<Controller>,
     // linux-dmabuf-v1
     dmabuf: Option<ZwpLinuxDmabufV1>,
@@ -66,6 +67,7 @@ impl Capturer {
             output: None,
             output_global_id: None,
             pending_frame: None,
+            dmabuf_formats: Vec::new(),
             controller: None,
             // linux-dmabuf-v1
             dmabuf: None,
@@ -374,19 +376,33 @@ impl Dispatch<ZwlrExportDmabufFrameV1, ()> for Capturer {
                 height,
                 num_objects,
                 format,
+                mod_high,
+                mod_low,
                 ..
             } => {
-                state.pending_frame = Some(Object::new(width, height, num_objects, format));
+                let modifier = ((mod_high as u64) << 32) | mod_low as u64;
+                log::trace!(
+                    "wlr-export-dmabuf frame: DRM format={format}, size={width}x{height}, objects={num_objects}, modifier={modifier:#018x}"
+                );
+                let mut pending_frame = Object::new(width, height, num_objects, format);
+                pending_frame.layout = Some((modifier, 0, 0));
+                state.pending_frame = Some(pending_frame);
             }
 
             Event::Object {
-                index, fd, size, ..
+                index,
+                fd,
+                size,
+                offset,
+                stride,
+                ..
             } => {
-                state
-                    .pending_frame
-                    .as_mut()
-                    .unwrap()
-                    .set_object(index, fd, size);
+                log::trace!(
+                    "wlr-export-dmabuf object: index={index}, size={size}, offset={offset}, stride={stride}"
+                );
+                let pending_frame = state.pending_frame.as_mut().unwrap();
+                pending_frame.layout = Some((pending_frame.layout.unwrap().0, offset, stride));
+                pending_frame.set_object(index, fd, size);
             }
 
             Event::Ready { .. } => {
@@ -425,11 +441,29 @@ impl Dispatch<ZwpLinuxDmabufV1, ()> for Capturer {
     fn event(
         _: &mut Self,
         _: &ZwpLinuxDmabufV1,
-        _: <ZwpLinuxDmabufV1 as Proxy>::Event,
+        event: <ZwpLinuxDmabufV1 as Proxy>::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::Event;
+
+        match event {
+            Event::Format { format } => {
+                log::debug!("linux-dmabuf-v1 advertised DRM format={format}");
+            }
+            Event::Modifier {
+                format,
+                modifier_hi,
+                modifier_lo,
+            } => {
+                let modifier = ((modifier_hi as u64) << 32) | modifier_lo as u64;
+                log::debug!(
+                    "linux-dmabuf-v1 advertised DRM format={format}, modifier={modifier:#018x}"
+                );
+            }
+            _ => {}
+        }
     }
 }
 
@@ -500,13 +534,17 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for Capturer {
                 }
 
                 if state.wl_buffer.is_none() {
+                    log::debug!(
+                        "wlr-screencopy DMA-BUF constraints: DRM format={format}, size={width}x{height}, using explicit linear modifier"
+                    );
                     let pending_frame = Object::new(width, height, 1, format);
                     let dmabuf_params = state.dmabuf.as_ref().unwrap().create_params(qh, ());
+                    let allowed_modifiers = [0];
                     let (fd, offset, stride, modifier) = state
                         .vulkan
                         .as_mut()
                         .unwrap()
-                        .init_exportable_frame_image(&pending_frame)
+                        .init_exportable_frame_image(&pending_frame, &allowed_modifiers)
                         .expect("Unable to init exportable frame image");
 
                     let fd = unsafe { BorrowedFd::borrow_raw(fd) };
@@ -514,8 +552,8 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for Capturer {
                     dmabuf_params.add(
                         fd,
                         0,
-                        offset as u32,
-                        stride as u32,
+                        offset,
+                        stride,
                         (modifier >> 32) as u32,
                         (modifier & 0xFFFFFFFF) as u32,
                     );
@@ -624,13 +662,25 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for Capturer {
 
         match event {
             Event::BufferSize { width, height } => {
-                // TODO format is actually not known at this stage, see below
-                let pending_frame = Object::new(width, height, 1, 875713112);
-                state.pending_frame = Some(pending_frame);
+                log::debug!("ext-image-copy-capture DMA-BUF size constraint: {width}x{height}");
+                state.pending_frame = Some(Object::new(width, height, 1, 0));
             }
 
-            Event::DmabufFormat { .. } => {
-                // TODO figure out how to use modifiers from wl_screenrec, once I have a device that supports modifiers
+            Event::DmabufDevice { device } => {
+                log::debug!(
+                    "ext-image-copy-capture DMA-BUF allocation device dev_t bytes={device:02x?}"
+                );
+            }
+
+            Event::DmabufFormat { format, modifiers } => {
+                let modifiers: Vec<_> = modifiers
+                    .chunks_exact(8)
+                    .map(|bytes| u64::from_ne_bytes(bytes.try_into().unwrap()))
+                    .collect();
+                log::debug!(
+                    "ext-image-copy-capture DMA-BUF format constraint: DRM format={format}, modifiers={modifiers:#x?}"
+                );
+                state.dmabuf_formats.push((format, modifiers));
             }
 
             Event::Done => {
@@ -638,6 +688,34 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for Capturer {
                     buffer.destroy()
                 }
 
+                let dimensions = {
+                    let pending_frame = state.pending_frame.as_ref().unwrap();
+                    (pending_frame.width, pending_frame.height)
+                };
+                let selection = state.dmabuf_formats.iter().find_map(|(format, offered)| {
+                    let supported = state
+                        .vulkan
+                        .as_ref()
+                        .unwrap()
+                        .exportable_modifiers(*format)
+                        .ok()?;
+                    let modifiers: Vec<_> = offered
+                        .iter()
+                        .copied()
+                        .filter(|modifier| supported.contains(modifier))
+                        .collect();
+                    (!modifiers.is_empty()).then_some((*format, modifiers))
+                });
+                state.dmabuf_formats.clear();
+                let (format, modifiers) = selection.expect(
+                    "No compositor-provided DMA-BUF format and modifier can be exported by Vulkan",
+                );
+                log::debug!(
+                    "ext-image-copy-capture selected DMA-BUF constraints: DRM format={format}, size={}x{}, modifiers={modifiers:#x?}",
+                    dimensions.0,
+                    dimensions.1,
+                );
+                state.pending_frame = Some(Object::new(dimensions.0, dimensions.1, 1, format));
                 let pending_frame = state.pending_frame.as_ref().unwrap();
 
                 let dmabuf_params = state.dmabuf.as_ref().unwrap().create_params(qh, ());
@@ -645,7 +723,7 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for Capturer {
                     .vulkan
                     .as_mut()
                     .unwrap()
-                    .init_exportable_frame_image(pending_frame)
+                    .init_exportable_frame_image(pending_frame, &modifiers)
                     .expect("Unable to init exportable frame image");
 
                 let fd = unsafe { BorrowedFd::borrow_raw(fd) };
@@ -653,8 +731,8 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for Capturer {
                 dmabuf_params.add(
                     fd,
                     0,
-                    offset as u32,
-                    stride as u32,
+                    offset,
+                    stride,
                     (modifier >> 32) as u32,
                     (modifier & 0xFFFFFFFF) as u32,
                 );

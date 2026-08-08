@@ -42,10 +42,20 @@ fn capture(node: u32, controller: Controller) -> Result<()> {
             *pw::keys::MEDIA_ROLE => "Screen",
         },
     )?;
+    let vulkan = Vulkan::new()?;
+    let mut modifiers = vulkan.importable_modifiers(DrmFourcc::Xrgb8888 as u32)?;
+    let rgbx_modifiers = vulkan.importable_modifiers(DrmFourcc::Xbgr8888 as u32)?;
+    modifiers.retain(|modifier| rgbx_modifiers.contains(modifier));
+    if modifiers.is_empty() {
+        return Err(anyhow!(
+            "Vulkan cannot import any common single-plane PipeWire DMA-BUF modifier"
+        ));
+    }
+    log::debug!("Advertising PipeWire DRM modifiers {modifiers:#x?}");
     let data = Data {
         controller,
         format: Default::default(),
-        vulkan: Vulkan::new()?,
+        vulkan,
     };
     let _listener = stream
         .add_local_listener_with_user_data(data)
@@ -62,6 +72,13 @@ fn capture(node: u32, controller: Controller) -> Result<()> {
                     data.format
                         .parse(param)
                         .expect("Unable to parse PipeWire video format");
+                    log::debug!(
+                        "Negotiated PipeWire DMA-BUF format: SPA format={:?}, DRM format={:?}, size={:?}, modifier={:#018x}",
+                        data.format.format(),
+                        drm_format(data.format.format()),
+                        data.format.size(),
+                        data.format.modifier(),
+                    );
                 }
             }
         })
@@ -96,6 +113,16 @@ fn capture(node: u32, controller: Controller) -> Result<()> {
                     .expect("PipeWire negotiated an unsupported video format")
                     as u32,
             );
+            log::trace!(
+                "Processing PipeWire DMA-BUF: DRM format={}, size={}x{}, modifier={:#018x}, offset={}, stride={}, object_size={}",
+                object.format,
+                object.width,
+                object.height,
+                state.format.modifier(),
+                chunk.offset(),
+                stride,
+                data.as_raw().maxsize,
+            );
             object.layout = Some((state.format.modifier(), chunk.offset(), stride));
             object.set_object(0, fd, data.as_raw().maxsize);
             let luma = state
@@ -128,7 +155,7 @@ fn capture(node: u32, controller: Controller) -> Result<()> {
             pw::spa::param::video::VideoFormat::BGRx,
             pw::spa::param::video::VideoFormat::RGBx,
         ),
-        modifier_property(),
+        modifier_property(&modifiers),
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::VideoSize,
             Choice,
@@ -174,15 +201,15 @@ fn capture(node: u32, controller: Controller) -> Result<()> {
     Ok(())
 }
 
-fn modifier_property() -> spa::pod::Property {
+fn modifier_property(modifiers: &[u64]) -> spa::pod::Property {
     spa::pod::Property {
         key: spa::param::format::FormatProperties::VideoModifier.as_raw(),
         flags: spa::pod::PropertyFlags::MANDATORY | spa::pod::PropertyFlags::DONT_FIXATE,
         value: spa::pod::Value::Choice(spa::pod::ChoiceValue::Long(spa::utils::Choice(
             spa::utils::ChoiceFlags::empty(),
             spa::utils::ChoiceEnum::Enum {
-                default: 0,
-                alternatives: vec![0],
+                default: modifiers[0] as i64,
+                alternatives: modifiers.iter().map(|modifier| *modifier as i64).collect(),
             },
         ))),
     }
