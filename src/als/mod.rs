@@ -5,6 +5,7 @@ use std::collections::HashMap;
 pub mod controller;
 pub mod iio;
 pub mod none;
+mod sensor_proxy;
 pub mod time;
 pub mod webcam;
 

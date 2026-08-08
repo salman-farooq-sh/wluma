@@ -22,49 +22,41 @@ enum SensorType {
     },
 }
 
+enum Source {
+    SensorProxy(Mutex<super::sensor_proxy::Sensor>),
+    Sysfs(Box<SensorType>),
+}
+
 pub struct Als {
-    sensor: SensorType,
+    source: Source,
     thresholds: HashMap<u64, String>,
 }
 
 impl Als {
-    pub async fn new(base_path: &str, thresholds: HashMap<u64, String>) -> Result<Self> {
-        smol::fs::read_dir(base_path)
-            .await
-            .map_err(|e| anyhow!("Can't enumerate iio devices: {e}"))?
-            .filter_map(|r| async { r.ok() })
-            .then(|entry| {
-                smol::fs::read_to_string(entry.path().join("name")).map(|name| (name, entry))
-            })
-            .filter_map(|(name, entry)| async {
-                [
-                    "als",
-                    "acpi-als",
-                    "apds9960",
-                    "cros-ec-light",
-                    "aop-sensors-als",
-                ]
-                .contains(&name.unwrap_or_default().trim())
-                .then_some(entry)
-            })
-            .filter_map(|entry| async move {
-                // TODO should probably start from the `parse_illuminance_input` in the next major version
-                parse_illuminance_raw(entry.path())
-                    .or_else(|_| parse_illuminance_input(entry.path()))
-                    .or_else(|_| parse_intensity_raw(entry.path()))
-                    .or_else(|_| parse_intensity_rgb(entry.path()))
-                    .await
-                    .map(Some)
-                    .unwrap_or_else(|_| {
-                        log::error!("Failed to read sensor '{}'", entry.path().display());
-                        None
-                    })
-            })
-            .boxed()
-            .next()
-            .await
-            .map(|sensor| Self { sensor, thresholds })
-            .ok_or_else(|| anyhow!("No iio device found"))
+    pub async fn new(base_path: Option<&str>, thresholds: HashMap<u64, String>) -> Result<Self> {
+        let source = match smol::unblock(super::sensor_proxy::Sensor::new).await {
+            Ok(sensor) => {
+                if base_path.is_some() {
+                    log::warn!(
+                        "Using iio-sensor-proxy; remove the deprecated IIO 'path' from your config."
+                    );
+                } else {
+                    log::debug!("Using iio-sensor-proxy for ambient light");
+                }
+                Source::SensorProxy(Mutex::new(sensor))
+            }
+            Err(proxy_error) => {
+                log::debug!("Unable to use iio-sensor-proxy: {proxy_error}");
+                let base_path = base_path.ok_or_else(|| {
+                    anyhow!(
+                        "Unable to use iio-sensor-proxy and no IIO path is configured: {proxy_error}"
+                    )
+                })?;
+                Source::Sysfs(Box::new(find_sensor(base_path).await?))
+            }
+        };
+
+        Ok(Self { source, thresholds })
     }
 
     pub async fn get(&self) -> Result<String> {
@@ -76,24 +68,58 @@ impl Als {
     }
 
     async fn get_raw(&self) -> Result<u64> {
-        Ok(match self.sensor {
-            Illuminance {
-                ref value,
-                scale,
-                offset,
-            } => (read(value.lock().await.deref_mut()).await? + offset) * scale,
-
-            Intensity {
-                ref r,
-                ref g,
-                ref b,
-            } => {
-                -0.32466 * read(r.lock().await.deref_mut()).await?
-                    + 1.57837 * read(g.lock().await.deref_mut()).await?
-                    + -0.73191 * read(b.lock().await.deref_mut()).await?
-            }
-        } as u64)
+        match &self.source {
+            Source::SensorProxy(sensor) => Ok(sensor.lock().await.get_raw().await),
+            Source::Sysfs(sensor) => Ok(match sensor.as_ref() {
+                Illuminance {
+                    value,
+                    scale,
+                    offset,
+                } => (read(value.lock().await.deref_mut()).await? + offset) * scale,
+                Intensity { r, g, b } => {
+                    -0.32466 * read(r.lock().await.deref_mut()).await?
+                        + 1.57837 * read(g.lock().await.deref_mut()).await?
+                        + -0.73191 * read(b.lock().await.deref_mut()).await?
+                }
+            } as u64),
+        }
     }
+}
+
+async fn find_sensor(base_path: &str) -> Result<SensorType> {
+    smol::fs::read_dir(base_path)
+        .await
+        .map_err(|e| anyhow!("Can't enumerate iio devices: {e}"))?
+        .filter_map(|r| async { r.ok() })
+        .then(|entry| smol::fs::read_to_string(entry.path().join("name")).map(|name| (name, entry)))
+        .filter_map(|(name, entry)| async {
+            [
+                "als",
+                "acpi-als",
+                "apds9960",
+                "cros-ec-light",
+                "aop-sensors-als",
+            ]
+            .contains(&name.unwrap_or_default().trim())
+            .then_some(entry)
+        })
+        .filter_map(|entry| async move {
+            // TODO should probably start from the `parse_illuminance_input` in the next major version
+            parse_illuminance_raw(entry.path())
+                .or_else(|_| parse_illuminance_input(entry.path()))
+                .or_else(|_| parse_intensity_raw(entry.path()))
+                .or_else(|_| parse_intensity_rgb(entry.path()))
+                .await
+                .map(Some)
+                .unwrap_or_else(|_| {
+                    log::error!("Failed to read sensor '{}'", entry.path().display());
+                    None
+                })
+        })
+        .boxed()
+        .next()
+        .await
+        .ok_or_else(|| anyhow!("No iio device found"))
 }
 
 async fn parse_illuminance_raw(path: PathBuf) -> Result<SensorType> {

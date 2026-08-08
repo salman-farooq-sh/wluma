@@ -73,6 +73,16 @@ The `config.toml` in repository represents default config values. To change them
 
 Choose whether to use a real IIO-based ambient light sensor (`[als.iio]`), a webcam-based simulation (`[als.webcam]`), a time-based simulation (`[als.time]`) or disable it altogether (`[als.none]`).
 
+When `[als.iio]` is configured, wluma uses `iio-sensor-proxy` over the system D-Bus and reports light levels in lux. This is the recommended setup, as it avoids repeatedly polling the sensor through sysfs. Make sure the `iio-sensor-proxy` service is installed and available.
+
+The legacy `path` field is deprecated, it enables direct IIO sysfs polling when `iio-sensor-proxy` is unavailable at startup; remove it once `iio-sensor-proxy` works on your system.
+
+```toml
+[als.iio]
+path = "/sys/bus/iio/devices" # deprecated direct IIO sysfs polling
+thresholds = { 0 = "night", 20 = "dark", 80 = "dim", 250 = "normal", 500 = "bright", 800 = "outdoors" }
+```
+
 Each of them contains a `thresholds` field, which comes with good default values. It is there to convert generally exponential lux values into a linear scale to improve the prediction algorithm in `wluma`. Keys are the raw values from ambient light sensor (maximal value depends on the implementation), values are arbitrary "profiles". `wluma` will predict the best screen brightness according to the data learned within the same ALS profile.
 
 ### Displays

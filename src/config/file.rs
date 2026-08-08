@@ -22,7 +22,7 @@ pub enum Capturer {
 #[serde(rename_all = "lowercase")]
 pub enum Als {
     Iio {
-        path: String,
+        path: Option<String>,
         thresholds: HashMap<String, String>,
     },
     Time {

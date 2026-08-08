@@ -142,6 +142,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_iio_path_is_optional() {
+        let config = parse_config_str(
+            r#"
+[als.iio]
+thresholds = { 0 = "night" }
+"#,
+        )
+        .unwrap();
+
+        match config.als {
+            app::Als::Iio { path, .. } => assert_eq!(path, None),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_iio_path_can_configure_fallback() {
+        let config = parse_config_str(
+            r#"
+[als.iio]
+path = "/sys/bus/iio/devices"
+thresholds = { 0 = "night" }
+"#,
+        )
+        .unwrap();
+
+        match config.als {
+            app::Als::Iio { path, .. } => {
+                assert_eq!(path.as_deref(), Some("/sys/bus/iio/devices"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
     fn test_ddc_identifier_defaults_to_output_name() {
         let config = parse_config_str(
             r#"

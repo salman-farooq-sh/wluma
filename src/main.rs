@@ -133,9 +133,9 @@ async fn main() {
 
     let als: als::Als = match config.als {
         config::Als::Iio { path, thresholds } => als::Als::Iio(
-            als::iio::Als::new(&path, thresholds)
+            als::iio::Als::new(path.as_deref(), thresholds)
                 .await
-                .expect("Unable to initialize ALS IIO sensor"),
+                .expect("Unable to initialize ambient light sensor"),
         ),
         config::Als::Time { thresholds } => als::Als::Time(als::time::Als::new(thresholds)),
         config::Als::Webcam { video, thresholds } => als::Als::Webcam({

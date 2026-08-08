@@ -29,7 +29,7 @@ pub enum Capturer {
 #[derive(Debug)]
 pub enum Als {
     Iio {
-        path: String,
+        path: Option<String>,
         thresholds: HashMap<u64, String>,
     },
     Time {
