@@ -1,6 +1,6 @@
 use crate::device_file::read;
 use anyhow::{anyhow, Error, Result};
-use futures_util::{FutureExt, StreamExt, TryFutureExt};
+use futures_util::{StreamExt, TryFutureExt};
 use smol::fs::File;
 use smol::lock::Mutex;
 use std::collections::HashMap;
@@ -91,35 +91,25 @@ async fn find_sensor(base_path: &str) -> Result<SensorType> {
         .await
         .map_err(|e| anyhow!("Can't enumerate iio devices: {e}"))?
         .filter_map(|r| async { r.ok() })
-        .then(|entry| smol::fs::read_to_string(entry.path().join("name")).map(|name| (name, entry)))
-        .filter_map(|(name, entry)| async {
-            [
-                "als",
-                "acpi-als",
-                "apds9960",
-                "cros-ec-light",
-                "aop-sensors-als",
-            ]
-            .contains(&name.unwrap_or_default().trim())
-            .then_some(entry)
-        })
         .filter_map(|entry| async move {
+            let path = entry.path();
             // TODO should probably start from the `parse_illuminance_input` in the next major version
-            parse_illuminance_raw(entry.path())
-                .or_else(|_| parse_illuminance_input(entry.path()))
-                .or_else(|_| parse_intensity_raw(entry.path()))
-                .or_else(|_| parse_intensity_rgb(entry.path()))
+            parse_illuminance_raw(path.clone())
+                .or_else(|_| parse_illuminance_input(path.clone()))
+                .or_else(|_| parse_intensity_raw(path.clone()))
+                .or_else(|_| parse_intensity_rgb(path.clone()))
                 .await
-                .map(Some)
-                .unwrap_or_else(|_| {
-                    log::error!("Failed to read sensor '{}'", entry.path().display());
-                    None
-                })
+                .ok()
+                .map(|sensor| (path, sensor))
         })
         .boxed()
         .next()
         .await
-        .ok_or_else(|| anyhow!("No iio device found"))
+        .map(|(path, sensor)| {
+            log::debug!("Using IIO ambient light sensor '{}'", path.display());
+            sensor
+        })
+        .ok_or_else(|| anyhow!("No supported IIO ambient light sensor found"))
 }
 
 async fn parse_illuminance_raw(path: PathBuf) -> Result<SensorType> {
