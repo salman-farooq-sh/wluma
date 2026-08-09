@@ -13,7 +13,7 @@ thresholds = { 0 = "night", 20 = "dark", 80 = "dim", 250 = "normal", 500 = "brig
 [[output.backlight]]
 name = "eDP-1"
 path = "/sys/class/backlight/intel_backlight"
-capturer = "wayland"
+capturer = "auto"
 
 # [[output.ddcutil]]
 # name = "HDMI-A-3"

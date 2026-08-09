@@ -30,6 +30,7 @@ pub enum PipewireProtocol {
 
 #[derive(Debug, Clone)]
 pub enum Capturer {
+    Auto,
     Wayland(WaylandProtocol),
     Pipewire(PipewireProtocol),
     None,

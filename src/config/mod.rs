@@ -31,6 +31,7 @@ fn match_predictor(predictor: file::Predictor) -> app::Predictor {
 
 fn match_capturer(capturer: file::Capturer) -> app::Capturer {
     match capturer {
+        file::Capturer::Auto => app::Capturer::Auto,
         file::Capturer::None => app::Capturer::None,
         file::Capturer::Wlroots => {
             log::warn!(

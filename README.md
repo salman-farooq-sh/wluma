@@ -4,7 +4,7 @@ A tool for Wayland compositors to automatically adjust screen brightness based o
 
 ## Supported screen capture protocols
 
-With the default `capturer = "wayland"`, `wluma` will automatically detect supported Wayland protocols and pick the most appropriate one. PipeWire capture must be selected explicitly. See the "Configuration" section below for details.
+With the default `capturer = "auto"`, `wluma` first looks for a supported Wayland capture protocol, then tries PipeWire, and falls back to using ambient light only if neither is available. See the "Configuration" section below for details.
 
 The list of supported protocols:
 
@@ -98,9 +98,9 @@ For `output.ddcutil`, if the identifier that works for brightness control is not
 
 _Tip:_ run `wluma` with `RUST_LOG=debug` to see how your outputs are being identified, so that you can choose an appropriate `name` and `identifier` configuration values.
 
-The `capturer` field will determine how screen contents will be captured. Currently supported values are `wayland` (works only on Wayland compositors that support protocols listed in the top), `pipewire` and `none` (ignores screen contents and predicts brightness only based on ALS). The value `wayland` automatically chooses the most appropriate Wayland protocol, but you can force a specific one with `ext-image-copy-capture-v1`, `wlr-screencopy-unstable-v1` or `wlr-export-dmabuf-unstable-v1`. The value `pipewire` similarly automatically chooses the most appropriate protocol, and you can force a specific source with `zkde-screencast-unstable-v1`, `gnome-mutter-screencast` or `xdg-desktop-portal-screencast`.
+The `capturer` field will determine how screen contents will be captured. Currently supported values are `auto`, `wayland`, `pipewire` and `none` (ignores screen contents and predicts brightness only based on ALS). The default value `auto` tries supported Wayland protocols first, then PipeWire sources, then falls back to `none`. The value `wayland` automatically chooses the most appropriate Wayland protocol, but you can force a specific one with `ext-image-copy-capture-v1`, `wlr-screencopy-unstable-v1` or `wlr-export-dmabuf-unstable-v1`. The value `pipewire` similarly automatically chooses the most appropriate protocol, and you can force a specific source with `zkde-screencast-unstable-v1`, `gnome-mutter-screencast` or `xdg-desktop-portal-screencast`.
 
-_Tip:_ run `wluma` with `RUST_LOG=debug` and `capturer="wayland"` to see which protocols are supported by your Wayland compositor, and which one `wluma` chooses to use.
+_Tip:_ run `wluma` with `RUST_LOG=debug` and `capturer="auto"` to see which protocols are supported and which capturer `wluma` chooses.
 
 When the ScreenCast portal is used, select the monitor matching the configured output on the first run. wluma asks the portal to persist this selection and stores its restore token in the XDG state directory, so supported portal backends can restore it without prompting after restart. A separate portal session and restore token are used for each configured output.
 
@@ -119,7 +119,7 @@ thresholds = { 0 = "night", 8 = "day", 18 = "night" }
 [[output.backlight]]
 name = "eDP-1"
 path = "/sys/class/backlight/intel_backlight"
-capturer = "wayland"
+capturer = "auto"
 [output.backlight.predictor.manual]
 thresholds.day = { 0 = 0, 100 = 10 }
 thresholds.night = { 0 = 0, 100 = 60 }

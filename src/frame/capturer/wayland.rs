@@ -2,6 +2,7 @@ use crate::config::WaylandProtocol;
 use crate::frame::object::Object;
 use crate::frame::vulkan::Vulkan;
 use crate::predictor::Controller;
+use anyhow::{Context, Result};
 use std::os::fd::BorrowedFd;
 use std::thread;
 use std::time::Duration;
@@ -86,6 +87,29 @@ impl Capturer {
 }
 
 impl Capturer {
+    pub fn is_supported() -> Result<bool> {
+        let mut capturer = Self::new(WaylandProtocol::Any);
+        let connection = Connection::connect_to_env().context("Unable to connect to Wayland")?;
+        let display = connection.display();
+        let mut event_queue = connection.new_event_queue();
+        let qh = event_queue.handle();
+        display.get_registry(
+            &qh,
+            GlobalsContext {
+                global_id: None,
+                desired_output: String::new(),
+            },
+        );
+        event_queue
+            .roundtrip(&mut capturer)
+            .context("Unable to query Wayland protocols")?;
+        Ok(capturer.img_copy_capture_manager.is_some()
+            && capturer.img_capture_source_manager.is_some()
+            && capturer.dmabuf.is_some()
+            || capturer.screencopy_manager.is_some() && capturer.dmabuf.is_some()
+            || capturer.dmabuf_manager.is_some())
+    }
+
     pub fn run(&mut self, output_name: &str, controller: Controller) {
         let connection =
             Connection::connect_to_env().expect("Unable to connect to Wayland display");

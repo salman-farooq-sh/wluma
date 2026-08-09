@@ -3,9 +3,11 @@ use std::collections::HashMap;
 
 #[derive(Deserialize, Debug, Default)]
 pub enum Capturer {
+    #[default]
+    #[serde(rename = "auto")]
+    Auto,
     #[serde(rename = "wlroots")]
     Wlroots,
-    #[default]
     #[serde(rename = "wayland")]
     Wayland,
     #[serde(rename = "wlr-export-dmabuf-unstable-v1")]

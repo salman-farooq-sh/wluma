@@ -14,13 +14,20 @@ mod kwin;
 mod mutter;
 mod portal;
 
-type Portal = (dbus::arg::OwnedFd, dbus::blocking::Connection);
+pub(super) type Portal = (dbus::arg::OwnedFd, dbus::blocking::Connection);
+pub(super) type Source = (u32, Option<Portal>);
 
 const FRAME_RATE: u32 = 10;
 const FRAME_INTERVAL: Duration = Duration::from_millis(1000 / FRAME_RATE as u64);
 
 pub fn run(output_name: &str, protocol: PipewireProtocol, controller: Controller) {
-    let source = match protocol {
+    let source = prepare(output_name, protocol)
+        .unwrap_or_else(|error| panic!("Unable to create PipeWire screen stream: {error:#}"));
+    run_prepared(source, controller);
+}
+
+pub(super) fn prepare(output_name: &str, protocol: PipewireProtocol) -> Result<Source> {
+    match protocol {
         PipewireProtocol::Any => automatic_source(output_name),
         PipewireProtocol::Portal => portal_source(output_name),
         PipewireProtocol::Kwin => kwin::node(output_name).and_then(|(node, _)| {
@@ -31,12 +38,14 @@ pub fn run(output_name: &str, protocol: PipewireProtocol, controller: Controller
             .and_then(|connector| mutter::node(&connector))
             .map(|node| (node, None)),
     }
-    .unwrap_or_else(|error| panic!("Unable to create PipeWire screen stream: {error:#}"));
+}
+
+pub(super) fn run_prepared(source: Source, controller: Controller) {
     capture(source.0, source.1, controller)
         .unwrap_or_else(|error| panic!("Unable to capture PipeWire screen stream: {error:#}"));
 }
 
-fn automatic_source(output_name: &str) -> Result<(u32, Option<Portal>)> {
+fn automatic_source(output_name: &str) -> Result<Source> {
     let connector = match kwin::node(output_name) {
         Ok((Some(node), _)) => return Ok((node, None)),
         Ok((None, connector)) => connector,

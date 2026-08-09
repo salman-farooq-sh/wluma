@@ -88,6 +88,7 @@ async fn main() {
 
                         tasks.push(smol::spawn(async move {
                             let frame_capturer: frame::capturer::Capturer = match output_capturer {
+                                config::Capturer::Auto => frame::capturer::Capturer::Auto,
                                 config::Capturer::Wayland(protocol) => {
                                     frame::capturer::Capturer::Wayland(
                                         frame::capturer::wayland::Capturer::new(protocol),
