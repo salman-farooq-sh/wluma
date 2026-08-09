@@ -9,6 +9,7 @@ mod config;
 mod device_file;
 mod frame;
 mod predictor;
+mod state;
 
 /// Current app version (determined at compile-time).
 pub const VERSION: &str = env!("WLUMA_VERSION");
@@ -27,6 +28,14 @@ async fn main() {
         .init();
 
     log::debug!("== wluma v{} ==", VERSION);
+
+    match state::migrate() {
+        Ok(true) => log::info!(
+            "Learned data has been migrated from $XDG_DATA_HOME/wluma to $XDG_STATE_HOME/wluma."
+        ),
+        Ok(false) => {}
+        Err(error) => panic!("Unable to migrate data files to the XDG state directory: {error:#}"),
+    }
 
     let config = match config::load() {
         Ok(config) => config,
