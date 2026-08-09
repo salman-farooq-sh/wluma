@@ -84,7 +84,9 @@ async fn main() {
                                         frame::capturer::wayland::Capturer::new(protocol),
                                     )
                                 }
-                                config::Capturer::Pipewire => frame::capturer::Capturer::Pipewire,
+                                config::Capturer::Pipewire(protocol) => {
+                                    frame::capturer::Capturer::Pipewire(protocol)
+                                }
                                 config::Capturer::None => {
                                     frame::capturer::Capturer::None(Default::default())
                                 }

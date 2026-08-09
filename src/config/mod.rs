@@ -39,7 +39,16 @@ fn match_capturer(capturer: file::Capturer) -> app::Capturer {
             app::Capturer::Wayland(app::WaylandProtocol::Any)
         }
         file::Capturer::Wayland => app::Capturer::Wayland(app::WaylandProtocol::Any),
-        file::Capturer::Pipewire => app::Capturer::Pipewire,
+        file::Capturer::Pipewire => app::Capturer::Pipewire(app::PipewireProtocol::Any),
+        file::Capturer::XdgDesktopPortalScreencast => {
+            app::Capturer::Pipewire(app::PipewireProtocol::Portal)
+        }
+        file::Capturer::ZkdeScreencastUnstableV1 => {
+            app::Capturer::Pipewire(app::PipewireProtocol::Kwin)
+        }
+        file::Capturer::GnomeMutterScreencast => {
+            app::Capturer::Pipewire(app::PipewireProtocol::Mutter)
+        }
         file::Capturer::ExtImageCopyCaptureV1 => {
             app::Capturer::Wayland(app::WaylandProtocol::ExtImageCopyCaptureV1)
         }
@@ -178,24 +187,35 @@ thresholds = { 0 = "night" }
     }
 
     #[test]
-    fn test_pipewire_capturer() {
-        let config = parse_config_str(
-            r#"
+    fn test_pipewire_capturers() {
+        for (value, expected) in [
+            ("pipewire", app::PipewireProtocol::Any),
+            (
+                "xdg-desktop-portal-screencast",
+                app::PipewireProtocol::Portal,
+            ),
+            ("zkde-screencast-unstable-v1", app::PipewireProtocol::Kwin),
+            ("gnome-mutter-screencast", app::PipewireProtocol::Mutter),
+        ] {
+            let config = parse_config_str(&format!(
+                r#"
 [als.none]
 
 [[output.backlight]]
 name = "panel"
 path = "/sys/class/backlight/panel"
-capturer = "pipewire"
+capturer = "{value}"
 "#,
-        )
-        .unwrap();
+            ))
+            .unwrap();
 
-        match &config.output[0] {
-            app::Output::Backlight(output) => {
-                assert!(matches!(output.capturer, app::Capturer::Pipewire));
+            match &config.output[0] {
+                app::Output::Backlight(output) => match &output.capturer {
+                    app::Capturer::Pipewire(protocol) => assert_eq!(*protocol, expected),
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
             }
-            _ => unreachable!(),
         }
     }
 

@@ -1,3 +1,4 @@
+use crate::config::PipewireProtocol;
 use crate::frame::object::Object;
 use crate::frame::vulkan::Vulkan;
 use crate::predictor::Controller;
@@ -6,20 +7,52 @@ use drm_fourcc::DrmFourcc;
 use pipewire as pw;
 use pw::spa;
 use pw::spa::pod::Pod;
-use std::os::fd::BorrowedFd;
+use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 
-mod kde;
+mod kwin;
 mod mutter;
+mod portal;
 
-pub fn run(output_name: &str, controller: Controller) {
-    let node = kde::node(output_name)
-        .and_then(|(node, connector)| match node {
-            Some(node) => Ok(node),
-            None => mutter::node(connector.as_deref().unwrap_or(output_name)),
-        })
-        .unwrap_or_else(|error| panic!("Unable to create PipeWire screen stream: {error:#}"));
-    capture(node, controller)
+type Portal = (dbus::arg::OwnedFd, dbus::blocking::Connection);
+
+pub fn run(output_name: &str, protocol: PipewireProtocol, controller: Controller) {
+    let source = match protocol {
+        PipewireProtocol::Any => automatic_source(output_name),
+        PipewireProtocol::Portal => portal_source(output_name),
+        PipewireProtocol::Kwin => kwin::node(output_name).and_then(|(node, _)| {
+            node.map(|node| (node, None))
+                .ok_or_else(|| anyhow!("KWin PipeWire screencast protocol is not available"))
+        }),
+        PipewireProtocol::Mutter => kwin::connector(output_name)
+            .and_then(|connector| mutter::node(&connector))
+            .map(|node| (node, None)),
+    }
+    .unwrap_or_else(|error| panic!("Unable to create PipeWire screen stream: {error:#}"));
+    capture(source.0, source.1, controller)
         .unwrap_or_else(|error| panic!("Unable to capture PipeWire screen stream: {error:#}"));
+}
+
+fn automatic_source(output_name: &str) -> Result<(u32, Option<Portal>)> {
+    let connector = match kwin::node(output_name) {
+        Ok((Some(node), _)) => return Ok((node, None)),
+        Ok((None, connector)) => connector,
+        Err(error) => {
+            log::debug!("KWin PipeWire capture is unavailable: {error:#}");
+            None
+        }
+    };
+    match mutter::node(connector.as_deref().unwrap_or(output_name)) {
+        Ok(node) => Ok((node, None)),
+        Err(error) => {
+            log::debug!("Mutter PipeWire capture is unavailable: {error:#}");
+            portal_source(output_name)
+        }
+    }
+}
+
+fn portal_source(output_name: &str) -> Result<(u32, Option<Portal>)> {
+    let source = portal::source(output_name)?;
+    Ok((source.node, Some((source.remote, source.connection))))
 }
 
 struct Data {
@@ -28,11 +61,17 @@ struct Data {
     vulkan: Vulkan,
 }
 
-fn capture(node: u32, controller: Controller) -> Result<()> {
+fn capture(node: u32, portal: Option<Portal>, controller: Controller) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
-    let core = context.connect_rc(None)?;
+    let (core, _portal_connection) = match portal {
+        Some((remote, connection)) => {
+            let remote = unsafe { OwnedFd::from_raw_fd(remote.into_raw_fd()) };
+            (context.connect_fd_rc(remote, None)?, Some(connection))
+        }
+        None => (context.connect_rc(None)?, None),
+    };
     let stream = pw::stream::StreamBox::new(
         &core,
         "wluma",

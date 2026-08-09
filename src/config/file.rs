@@ -16,6 +16,12 @@ pub enum Capturer {
     ExtImageCopyCaptureV1,
     #[serde(rename = "pipewire")]
     Pipewire,
+    #[serde(rename = "xdg-desktop-portal-screencast")]
+    XdgDesktopPortalScreencast,
+    #[serde(rename = "zkde-screencast-unstable-v1")]
+    ZkdeScreencastUnstableV1,
+    #[serde(rename = "gnome-mutter-screencast")]
+    GnomeMutterScreencast,
     #[serde(rename = "none")]
     None,
 }

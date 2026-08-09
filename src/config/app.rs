@@ -20,10 +20,18 @@ impl fmt::Display for WaylandProtocol {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum PipewireProtocol {
+    Any,
+    Portal,
+    Kwin,
+    Mutter,
+}
+
 #[derive(Debug, Clone)]
 pub enum Capturer {
     Wayland(WaylandProtocol),
-    Pipewire,
+    Pipewire(PipewireProtocol),
     None,
 }
 

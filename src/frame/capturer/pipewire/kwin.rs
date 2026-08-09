@@ -24,6 +24,15 @@ struct State {
 }
 
 pub(super) fn node(output_name: &str) -> Result<(Option<u32>, Option<String>)> {
+    find(output_name, true)
+}
+
+pub(super) fn connector(output_name: &str) -> Result<String> {
+    let (_, connector) = find(output_name, false)?;
+    connector.ok_or_else(|| anyhow!("Unable to determine the connector for '{output_name}'"))
+}
+
+fn find(output_name: &str, create_stream: bool) -> Result<(Option<u32>, Option<String>)> {
     let connection = Connection::connect_to_env().context("Unable to connect to Wayland")?;
     let display = connection.display();
     let mut queue = connection.new_event_queue();
@@ -40,13 +49,16 @@ pub(super) fn node(output_name: &str) -> Result<(Option<u32>, Option<String>)> {
     queue.roundtrip(&mut state)?;
     queue.roundtrip(&mut state)?;
 
-    let Some(manager) = state.manager.as_ref() else {
-        return Ok((None, state.output_name));
-    };
     let output = state
         .output
         .as_ref()
-        .ok_or_else(|| anyhow!("Unable to match '{output_name}' to a KDE output"))?;
+        .ok_or_else(|| anyhow!("Unable to match '{output_name}' to a Wayland output"))?;
+    if !create_stream {
+        return Ok((None, state.output_name));
+    }
+    let Some(manager) = state.manager.as_ref() else {
+        return Ok((None, state.output_name));
+    };
     manager.stream_output(output, Pointer::Hidden.into(), &qh, ());
 
     while state.node.is_none() && state.failure.is_none() {
@@ -58,7 +70,7 @@ pub(super) fn node(output_name: &str) -> Result<(Option<u32>, Option<String>)> {
 
     let node = state.node.unwrap();
     std::thread::spawn(move || while queue.blocking_dispatch(&mut state).is_ok() {});
-    log::debug!("Using KDE PipeWire stream node {node}");
+    log::debug!("Using KWin PipeWire stream node {node}");
     Ok((Some(node), None))
 }
 
@@ -123,9 +135,20 @@ impl Dispatch<WlOutput, OutputContext> for State {
             Event::Description { description } => description.contains(&context.desired_output),
             _ => false,
         };
-        if matches && state.output.is_none() {
-            state.output = Some(output.clone());
-            state.output_name = context.name.lock().unwrap().clone();
+        if matches {
+            match state.output.as_ref() {
+                None => {
+                    state.output = Some(output.clone());
+                    state.output_name = context.name.lock().unwrap().clone();
+                }
+                Some(selected) if selected != output => {
+                    log::error!(
+                        "Multiple Wayland outputs match '{}'",
+                        context.desired_output
+                    );
+                }
+                _ => {}
+            }
         }
     }
 }
