@@ -2,12 +2,15 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 mod app;
+mod discovery;
 mod file;
 use anyhow::{anyhow, Result};
 pub use app::*;
 
 pub fn load() -> Result<app::Config> {
-    validate(parse()?)
+    let mut config = parse()?;
+    config.output = discovery::merge(config.output, discovery::outputs());
+    validate(config)
 }
 
 fn match_predictor(predictor: file::Predictor) -> app::Predictor {
@@ -86,17 +89,19 @@ fn parse_config_str(file_config: &str) -> Result<app::Config, toml::de::Error> {
             .map(|o| {
                 app::Output::Backlight(app::BacklightOutput {
                     name: o.name,
-                    path: o.path,
+                    path: o.path.unwrap_or_default(),
                     min_brightness: 1,
                     capturer: match_capturer(o.capturer.unwrap_or_default()),
                     predictor: match_predictor(o.predictor.unwrap_or_default()),
                 })
             })
             .chain(file_config.output.ddcutil.into_iter().map(|o| {
-                let identifier = o.identifier.clone().unwrap_or_else(|| o.name.clone());
+                let identifier_overridden = o.identifier.is_some();
+                let identifier = o.identifier.unwrap_or_else(|| o.name.clone());
                 app::Output::DdcUtil(app::DdcUtilOutput {
                     name: o.name,
                     identifier,
+                    identifier_overridden,
                     min_brightness: 1,
                     capturer: match_capturer(o.capturer.unwrap_or_default()),
                     predictor: match_predictor(o.predictor.unwrap_or_default()),
@@ -141,7 +146,7 @@ fn validate(config: app::Config) -> Result<app::Config> {
         .collect::<HashSet<_>>();
 
     match (names.len(), names.len() == config.output.len()) {
-        (0, _) => Err(anyhow!("No output or keyboard configured")),
+        (0, _) => Err(anyhow!("No connected output or keyboard detected")),
         (_, false) => Err(anyhow!("Names of all outputs and keyboards are not unique")),
         _ => Ok(config),
     }
@@ -181,6 +186,29 @@ thresholds = { 0 = "night" }
         match config.als {
             app::Als::Iio { path, .. } => {
                 assert_eq!(path.as_deref(), Some("/sys/bus/iio/devices"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_backlight_override_needs_only_a_name() {
+        let config = parse_config_str(
+            r#"
+[als.none]
+
+[[output.backlight]]
+name = "eDP-1"
+capturer = "none"
+"#,
+        )
+        .unwrap();
+
+        match &config.output[0] {
+            app::Output::Backlight(output) => {
+                assert_eq!(output.name, "eDP-1");
+                assert!(output.path.is_empty());
+                assert!(matches!(output.capturer, app::Capturer::None));
             }
             _ => unreachable!(),
         }

@@ -10,19 +10,19 @@ thresholds = { 0 = "night", 20 = "dark", 80 = "dim", 250 = "normal", 500 = "brig
 
 # [als.none]
 
-[[output.backlight]]
-name = "eDP-1"
-path = "/sys/class/backlight/intel_backlight"
-capturer = "auto"
+# [[output.backlight]]
+# name = "eDP-1"
+# capturer = "none"
+# path = "/sys/class/backlight/intel_backlight"
 
 # [[output.ddcutil]]
 # name = "HDMI-A-3"
 # identifier = "Dell Inc. DELL P2415Q"
 # capturer = "none"
 
-[[keyboard]]
-name = "keyboard-dell"
-path = "/sys/bus/platform/devices/dell-laptop/leds/dell::kbd_backlight"
+# [[keyboard]]
+# name = "keyboard-dell"
+# path = "/sys/bus/platform/devices/dell-laptop/leds/dell::kbd_backlight"
 
 # [[keyboard]]
 # name = "keyboard-thinkpad"

@@ -73,6 +73,7 @@ pub struct BacklightOutput {
 pub struct DdcUtilOutput {
     pub name: String,
     pub identifier: String,
+    pub identifier_overridden: bool,
     pub capturer: Capturer,
     pub min_brightness: u64,
     pub predictor: Predictor,

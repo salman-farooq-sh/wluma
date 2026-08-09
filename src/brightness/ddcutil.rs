@@ -464,10 +464,15 @@ fn find_display_by_identifier(identifier: &str, check_caps: bool) -> Option<Disp
             caps.ok().map(|_| {
                 let empty = "".to_string();
                 let merged = format!(
-                    "{} {} {}",
+                    "{} {} {} {}",
                     display.info.model_name.as_ref().unwrap_or(&empty),
                     display.info.serial_number.as_ref().unwrap_or(&empty),
-                    display.info.manufacturer_id.as_ref().unwrap_or(&empty)
+                    display.info.manufacturer_id.as_ref().unwrap_or(&empty),
+                    display
+                        .info
+                        .serial
+                        .map(|value| value.to_string())
+                        .unwrap_or_default()
                 );
                 (merged, display)
             })

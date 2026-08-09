@@ -90,11 +90,21 @@ Each of them contains a `thresholds` field, which comes with good default values
 
 ### Displays
 
-Multiple outputs are supported, using `backlight` (common for internal laptop screens) and `ddcutil` (for external screens). DDC is known to often be problematic, always consider trying out [ddcci-driver-linux](https://gitlab.com/ddcci-driver-linux/ddcci-driver-linux) first if you can.
+The entire `output` section is optional. At startup, wluma discovers connected DRM outputs, associates internal panels with `/sys/class/backlight` devices and external monitors with DDC using their EDID, and automatically selects a screen capturer. Disconnected outputs are ignored. DDC is known to often be problematic, so always consider trying [ddcci-driver-linux](https://gitlab.com/ddcci-driver-linux/ddcci-driver-linux) first if you can.
 
-The `name` field in the output config identifies the Wayland output, and is matched as a substring against descriptions containing model, manufacturer and serial number (like `eDP-1 'Sharp Corporation 0x14A8 0x00000000' (eDP-1)`), so you are free to put simply `eDP-1`, `HDMI-A-3`, or a unique model/serial substring. It is your responsibility to make sure that the values you use match **uniquely** to one output only.
+To override the capturer or predictor for a discovered output, use the detected brightness type and DRM connector name reported with `RUST_LOG=debug`:
 
-For `output.ddcutil`, if the identifier that works for brightness control is not the same substring that your Wayland compositor exposes for screen capture, set `identifier`. This is common for external DDC monitors: `name` should match the compositor output description such as `HDMI-A-3` or `LG ULTRAWIDE`, while `identifier` may need to be a serial number for DDC.
+```toml
+[[output.ddcutil]]
+name = "HDMI-A-3"
+capturer = "none"
+```
+
+Explicit `output.backlight` and `output.ddcutil` entries remain supported. The `path` of a backlight entry is optional when its `name` matches a discovered connector. Supplying a path or DDC identifier overrides the discovered value.
+
+The `name` field identifies the Wayland output and is matched as a substring against descriptions containing model, manufacturer and serial number (like `eDP-1 'Sharp Corporation 0x14A8 0x00000000' (eDP-1)`). Automatically discovered output names use the unambiguous DRM connector name.
+
+For `output.ddcutil`, if the identifier that works for brightness control is not the same substring that your Wayland compositor exposes for screen capture, set `identifier`. This is common for external DDC monitors: `name` should match the compositor output description such as `HDMI-A-3`, while `identifier` may need to be a serial number for DDC.
 
 _Tip:_ run `wluma` with `RUST_LOG=debug` to see how your outputs are being identified, so that you can choose an appropriate `name` and `identifier` configuration values.
 
@@ -104,7 +114,11 @@ _Tip:_ run `wluma` with `RUST_LOG=debug` and `capturer="auto"` to see which prot
 
 When the ScreenCast portal is used, select the monitor matching the configured output on the first run. wluma asks the portal to persist this selection and stores its restore token in the XDG state directory, so supported portal backends can restore it without prompting after restart. A separate portal session and restore token are used for each configured output.
 
-#### Algorithm
+### Keyboards
+
+Keyboard backlights are automatically discovered under `/sys/class/leds` when their LED device name contains `kbd_backlight`, which covers common Dell, ThinkPad and ASUS devices. They are logged with `RUST_LOG=debug`. Explicit `[[keyboard]]` entries remain available for devices that do not follow this naming convention, and an entry pointing to an automatically discovered path replaces rather than duplicates it.
+
+### Algorithm
 
 The default algorithm that `wluma` uses is called `adaptive`, which is when it learns from you as you continue adjusting brightness manually. It will eventually figure out patterns in how you tend to adjust brightness in dark and lit conditions and depending on what is currently being displayed on the screen, and will beging to do it automatically for you.
 

@@ -65,7 +65,7 @@ pub enum Predictor {
 #[derive(Deserialize, Debug)]
 pub struct BacklightOutput {
     pub name: String,
-    pub path: String,
+    pub path: Option<String>,
     pub capturer: Option<Capturer>,
     pub predictor: Option<Predictor>,
 }
