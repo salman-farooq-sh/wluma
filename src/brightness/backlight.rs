@@ -8,6 +8,9 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
+const TRANSITION_STEP_MS: u64 = 16;
+const BRIGHTNESS_STEPS: u64 = 1000;
+
 struct Dbus {
     connection: Connection,
     message: Message,
@@ -128,6 +131,17 @@ impl Backlight {
             (Err(err), Some(cached)) if err.kind() == ErrorKind::WouldBlock => Ok(cached),
             (Err(err), _) => Err(err.into()),
         }
+    }
+
+    pub fn transition_step_ms(&self) -> u64 {
+        TRANSITION_STEP_MS
+    }
+
+    pub fn change_threshold(&self) -> u64 {
+        self.max_brightness
+            .saturating_sub(self.min_brightness)
+            .div_ceil(BRIGHTNESS_STEPS)
+            .max(1)
     }
 
     pub async fn set(&mut self, value: u64) -> Result<u64> {

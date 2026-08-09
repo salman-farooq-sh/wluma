@@ -16,6 +16,7 @@ pub enum Brightness {
     Mock {
         get: Vec<u64>,
         set: Vec<u64>,
+        change_threshold: u64,
     },
 }
 
@@ -46,10 +47,22 @@ impl Brightness {
     pub fn transition_step_ms(&self) -> u64 {
         match self {
             Brightness::DdcUtil(b) => b.transition_step_ms(),
-            Brightness::Backlight(_) => 1,
+            Brightness::Backlight(b) => b.transition_step_ms(),
 
             #[cfg(test)]
             Brightness::Mock { .. } => 1,
+        }
+    }
+
+    pub fn change_threshold(&self) -> u64 {
+        match self {
+            Brightness::DdcUtil(_) => 1,
+            Brightness::Backlight(b) => b.change_threshold(),
+
+            #[cfg(test)]
+            Brightness::Mock {
+                change_threshold, ..
+            } => *change_threshold,
         }
     }
 

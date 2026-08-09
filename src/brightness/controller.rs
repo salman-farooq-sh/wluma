@@ -90,7 +90,8 @@ impl Controller {
     fn update_target(&mut self, desired: u64) {
         match (&self.target, self.current) {
             (Some(old_target), _) if old_target.desired == desired => (),
-            (_, Some(current)) if desired == current => (),
+            (_, Some(current))
+                if desired.abs_diff(current) < self.brightness.change_threshold() => {}
             (_, Some(current)) => {
                 let max_transition_steps = TRANSITION_MAX_MS
                     .div_ceil(self.brightness.transition_step_ms())
@@ -148,12 +149,16 @@ mod tests {
     }
 
     fn brightness_mock(get: Vec<u64>, set: Vec<u64>) -> Brightness {
-        Brightness::Mock { get, set }
+        Brightness::Mock {
+            get,
+            set,
+            change_threshold: 1,
+        }
     }
 
     fn is_brightness_spent(mock: &Brightness) -> bool {
         match mock {
-            Brightness::Mock { get, set } => get.is_empty() && set.is_empty(),
+            Brightness::Mock { get, set, .. } => get.is_empty() && set.is_empty(),
             _ => unreachable!(),
         }
     }
@@ -251,6 +256,27 @@ mod tests {
         controller.update_target(7);
 
         assert_eq!(old_target, controller.target);
+    }
+
+    #[test]
+    fn test_update_target_ignores_changes_below_device_threshold() {
+        let (user_tx, _) = channel::bounded(1);
+        let (_, prediction_rx) = channel::bounded(1);
+        let brightness = Brightness::Mock {
+            get: vec![],
+            set: vec![],
+            change_threshold: 20,
+        };
+        let mut controller = Controller::new(brightness, user_tx, prediction_rx);
+        controller.current = Some(10000);
+
+        controller.update_target(10019);
+
+        assert_eq!(None, controller.target);
+
+        controller.update_target(10020);
+
+        assert_eq!(Some(target(10020, 1)), controller.target);
     }
 
     #[test]
