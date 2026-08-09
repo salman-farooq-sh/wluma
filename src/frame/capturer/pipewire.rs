@@ -8,12 +8,16 @@ use pipewire as pw;
 use pw::spa;
 use pw::spa::pod::Pod;
 use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::time::{Duration, Instant};
 
 mod kwin;
 mod mutter;
 mod portal;
 
 type Portal = (dbus::arg::OwnedFd, dbus::blocking::Connection);
+
+const FRAME_RATE: u32 = 10;
+const FRAME_INTERVAL: Duration = Duration::from_millis(1000 / FRAME_RATE as u64);
 
 pub fn run(output_name: &str, protocol: PipewireProtocol, controller: Controller) {
     let source = match protocol {
@@ -59,6 +63,7 @@ struct Data {
     controller: Controller,
     format: spa::param::video::VideoInfoRaw,
     vulkan: Vulkan,
+    last_frame_at: Option<Instant>,
 }
 
 fn capture(node: u32, portal: Option<Portal>, controller: Controller) -> Result<()> {
@@ -95,6 +100,7 @@ fn capture(node: u32, portal: Option<Portal>, controller: Controller) -> Result<
         controller,
         format: Default::default(),
         vulkan,
+        last_frame_at: None,
     };
     let _listener = stream
         .add_local_listener_with_user_data(data)
@@ -112,10 +118,12 @@ fn capture(node: u32, portal: Option<Portal>, controller: Controller) -> Result<
                         .parse(param)
                         .expect("Unable to parse PipeWire video format");
                     log::debug!(
-                        "Negotiated PipeWire DMA-BUF format: SPA format={:?}, DRM format={:?}, size={:?}, modifier={:#018x}",
+                        "Negotiated PipeWire DMA-BUF format: SPA format={:?}, DRM format={:?}, size={:?}, framerate={:?}, max_framerate={:?}, modifier={:#018x}",
                         data.format.format(),
                         drm_format(data.format.format()),
                         data.format.size(),
+                        data.format.framerate(),
+                        data.format.max_framerate(),
                         data.format.modifier(),
                     );
                 }
@@ -134,6 +142,14 @@ fn capture(node: u32, portal: Option<Portal>, controller: Controller) -> Result<
             if chunk.size() == 0 || chunk.flags().contains(spa::buffer::ChunkFlags::CORRUPTED) {
                 return;
             }
+            let now = Instant::now();
+            if state
+                .last_frame_at
+                .is_some_and(|last_frame_at| now.duration_since(last_frame_at) < FRAME_INTERVAL)
+            {
+                return;
+            }
+            state.last_frame_at = Some(now);
             let stride = u32::try_from(chunk.stride())
                 .ok()
                 .filter(|stride| *stride > 0)
@@ -218,9 +234,23 @@ fn capture(node: u32, portal: Option<Portal>, controller: Controller) -> Result<
             Choice,
             Range,
             Fraction,
-            pw::spa::utils::Fraction { num: 10, denom: 1 },
+            pw::spa::utils::Fraction {
+                num: FRAME_RATE,
+                denom: 1
+            },
             pw::spa::utils::Fraction { num: 0, denom: 1 },
-            pw::spa::utils::Fraction { num: 10, denom: 1 }
+            pw::spa::utils::Fraction {
+                num: FRAME_RATE,
+                denom: 1
+            }
+        ),
+        pw::spa::pod::property!(
+            pw::spa::param::format::FormatProperties::VideoMaxFramerate,
+            Fraction,
+            pw::spa::utils::Fraction {
+                num: FRAME_RATE,
+                denom: 1
+            }
         ),
     );
     let values = pw::spa::pod::serialize::PodSerializer::serialize(

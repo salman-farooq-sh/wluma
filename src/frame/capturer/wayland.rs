@@ -196,7 +196,14 @@ impl Capturer {
                                     .as_ref()
                                     .unwrap()
                                     .create_frame(&event_queue.handle(), ());
+                                let pending_frame = self.pending_frame.as_ref().unwrap();
                                 frame.attach_buffer(buffer);
+                                frame.damage_buffer(
+                                    0,
+                                    0,
+                                    pending_frame.width as i32,
+                                    pending_frame.height as i32,
+                                );
                                 frame.capture();
 
                                 self.is_processing_frame = true;
@@ -572,7 +579,12 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for Capturer {
                     state.pending_frame = Some(pending_frame);
                 }
 
-                frame.copy(state.wl_buffer.as_ref().unwrap());
+                let buffer = state.wl_buffer.as_ref().unwrap();
+                if frame.version() >= 2 {
+                    frame.copy_with_damage(buffer);
+                } else {
+                    frame.copy(buffer);
+                }
             }
 
             Event::Ready { .. } => {

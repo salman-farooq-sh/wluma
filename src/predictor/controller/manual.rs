@@ -1,8 +1,8 @@
-use super::{INITIAL_TIMEOUT_SECS, NEXT_ALS_COOLDOWN_RESET, PENDING_COOLDOWN_RESET};
+use super::{Cooldown, INITIAL_TIMEOUT, NEXT_ALS_COOLDOWN, PENDING_COOLDOWN};
 use crate::{channel_ext::ReceiverExt, predictor::data::Entry};
 use itertools::Itertools;
 use smol::channel::{Receiver, Sender};
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
 
 pub struct Controller {
     prediction_tx: Sender<u64>,
@@ -11,10 +11,10 @@ pub struct Controller {
     last_brightness: Option<u64>,
     thresholds: HashMap<String, HashMap<u8, u64>>,
     pre_reduction_brightness: Option<u64>,
-    pending_cooldown: u8,
+    pending_cooldown: Cooldown,
     last_als: Option<String>,
     next_als: Option<String>,
-    next_als_cooldown: u8,
+    next_als_cooldown: Cooldown,
     output_name: String,
 }
 
@@ -33,10 +33,10 @@ impl Controller {
             last_brightness: None,
             thresholds,
             pre_reduction_brightness: None,
-            pending_cooldown: 0,
+            pending_cooldown: Cooldown::default(),
             last_als: None,
             next_als: None,
-            next_als_cooldown: 0,
+            next_als_cooldown: Cooldown::default(),
             output_name: output_name.to_string(),
         }
     }
@@ -46,7 +46,7 @@ impl Controller {
             // ALS controller is expected to send the initial value on this channel asap
             self.last_als = Some(
                 self.als_rx
-                    .recv_or_panic_after_timeout(Duration::from_secs(INITIAL_TIMEOUT_SECS))
+                    .recv_or_panic_after_timeout(INITIAL_TIMEOUT)
                     .await
                     .expect("als_rx closed unexpectedly"),
             );
@@ -60,13 +60,10 @@ impl Controller {
         {
             new_als @ Some(_) if self.next_als != new_als => {
                 self.next_als = new_als;
-                self.next_als_cooldown = NEXT_ALS_COOLDOWN_RESET;
+                self.next_als_cooldown.reset(NEXT_ALS_COOLDOWN);
             }
-            _ if self.next_als_cooldown > 1 => {
-                self.next_als_cooldown -= 1;
-            }
-            _ if self.next_als_cooldown == 1 => {
-                self.next_als_cooldown = 0;
+            _ if self.next_als_cooldown.is_finished() => {
+                self.next_als_cooldown.clear();
                 self.last_als = self.next_als.take();
             }
             _ => {}
@@ -100,10 +97,9 @@ impl Controller {
 
         if self.last_brightness != Some(current_brightness) {
             self.process_brightness_change(current_brightness, lux, luma);
-            self.pending_cooldown = PENDING_COOLDOWN_RESET;
-        } else if self.pending_cooldown > 0 {
-            self.pending_cooldown -= 1;
-        } else {
+            self.pending_cooldown.reset(PENDING_COOLDOWN);
+        } else if !self.pending_cooldown.is_active() {
+            self.pending_cooldown.clear();
             self.predict(current_brightness, lux, luma).await;
         }
     }
@@ -251,16 +247,19 @@ mod tests {
 
         // Consequent user change causes prediction only after cooldown
         user_tx.send(123).await?;
-        for i in 0..=PENDING_COOLDOWN_RESET {
-            // User doesn't change brightness anymore, so even if lux or luma change, we are in cooldown period
-            controller.process(ALS_DIM, i).await;
-            assert_eq!(PENDING_COOLDOWN_RESET - i, controller.pending_cooldown);
-            assert!(prediction_rx.is_empty());
-        }
+        controller.process(ALS_DIM, 0).await;
+        assert!(controller.pending_cooldown.is_active());
+        assert!(prediction_rx.is_empty());
+
+        // User doesn't change brightness anymore, so even if lux or luma change, we are in cooldown period
+        controller.process(ALS_DIM, 10).await;
+        assert!(controller.pending_cooldown.is_active());
+        assert!(prediction_rx.is_empty());
 
         // One final call will generate the actual prediction
+        controller.pending_cooldown.finish();
         controller.process(ALS_DIM, 50).await;
-        assert_eq!(0, controller.pending_cooldown);
+        assert!(!controller.pending_cooldown.is_active());
         assert_eq!(87, prediction_rx.recv().await?);
 
         Ok(())

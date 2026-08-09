@@ -1,12 +1,41 @@
 use super::data::Entry;
 use itertools::Itertools;
+use std::time::{Duration, Instant};
 
 pub mod adaptive;
 pub mod manual;
 
-const INITIAL_TIMEOUT_SECS: u64 = 15;
-const PENDING_COOLDOWN_RESET: u8 = 15;
-const NEXT_ALS_COOLDOWN_RESET: u8 = 15;
+const INITIAL_TIMEOUT: Duration = Duration::from_secs(15);
+const PENDING_COOLDOWN: Duration = Duration::from_millis(1500);
+const NEXT_ALS_COOLDOWN: Duration = Duration::from_millis(1500);
+
+#[derive(Default)]
+struct Cooldown {
+    until: Option<Instant>,
+}
+
+impl Cooldown {
+    fn reset(&mut self, duration: Duration) {
+        self.until = Some(Instant::now() + duration);
+    }
+
+    fn is_active(&self) -> bool {
+        self.until.is_some_and(|until| Instant::now() < until)
+    }
+
+    fn is_finished(&self) -> bool {
+        self.until.is_some_and(|until| Instant::now() >= until)
+    }
+
+    fn clear(&mut self) {
+        self.until = None;
+    }
+
+    #[cfg(test)]
+    fn finish(&mut self) {
+        self.until = Some(Instant::now());
+    }
+}
 
 #[allow(clippy::large_enum_variant)]
 pub enum Controller {

@@ -1,24 +1,23 @@
 use smol::channel::{Receiver, Sender};
 
-use super::{INITIAL_TIMEOUT_SECS, NEXT_ALS_COOLDOWN_RESET, PENDING_COOLDOWN_RESET};
+use super::{Cooldown, INITIAL_TIMEOUT, NEXT_ALS_COOLDOWN, PENDING_COOLDOWN};
 use crate::{
     channel_ext::ReceiverExt,
     predictor::data::{Data, Entry},
 };
-use std::time::Duration;
 
 pub struct Controller {
     prediction_tx: Sender<u64>,
     user_rx: Receiver<u64>,
     als_rx: Receiver<String>,
-    pending_cooldown: u8,
+    pending_cooldown: Cooldown,
     pending: Option<Entry>,
     data: Data,
     stateful: bool,
     initial_brightness: Option<u64>,
     last_als: Option<String>,
     next_als: Option<String>,
-    next_als_cooldown: u8,
+    next_als_cooldown: Cooldown,
     output_name: String,
 }
 
@@ -40,14 +39,14 @@ impl Controller {
             prediction_tx,
             user_rx,
             als_rx,
-            pending_cooldown: 0,
+            pending_cooldown: Cooldown::default(),
             pending: None,
             data,
             stateful,
             initial_brightness: None,
             last_als: None,
             next_als: None,
-            next_als_cooldown: 0,
+            next_als_cooldown: Cooldown::default(),
             output_name: output_name.to_string(),
         }
     }
@@ -57,7 +56,7 @@ impl Controller {
             // ALS controller is expected to send the initial value on this channel asap
             self.last_als = Some(
                 self.als_rx
-                    .recv_or_panic_after_timeout(Duration::from_secs(INITIAL_TIMEOUT_SECS))
+                    .recv_or_panic_after_timeout(INITIAL_TIMEOUT)
                     .await
                     .expect("als_rx closed unexpectedly"),
             );
@@ -65,7 +64,7 @@ impl Controller {
             // Brightness controller is expected to send the initial value on this channel asap
             let initial_brightness = self
                 .user_rx
-                .recv_or_panic_after_timeout(Duration::from_secs(INITIAL_TIMEOUT_SECS))
+                .recv_or_panic_after_timeout(INITIAL_TIMEOUT)
                 .await
                 .expect("user_rx closed unexpectedly");
 
@@ -84,13 +83,10 @@ impl Controller {
         {
             new_als @ Some(_) if self.next_als != new_als => {
                 self.next_als = new_als;
-                self.next_als_cooldown = NEXT_ALS_COOLDOWN_RESET;
+                self.next_als_cooldown.reset(NEXT_ALS_COOLDOWN);
             }
-            _ if self.next_als_cooldown > 1 => {
-                self.next_als_cooldown -= 1;
-            }
-            _ if self.next_als_cooldown == 1 => {
-                self.next_als_cooldown = 0;
+            _ if self.next_als_cooldown.is_finished() => {
+                self.next_als_cooldown.clear();
                 self.last_als = self.next_als.take();
             }
             _ => {}
@@ -118,13 +114,14 @@ impl Controller {
                 Some(Entry { lux, luma, .. }) => Some(Entry::new(lux, *luma, brightness)),
             };
             // Every time user changed brightness, reset the cooldown period
-            self.pending_cooldown = PENDING_COOLDOWN_RESET;
-        } else if self.pending_cooldown > 0 {
-            self.pending_cooldown -= 1;
-        } else if self.pending.is_some() {
-            self.learn();
-        } else {
-            self.predict(lux, luma).await;
+            self.pending_cooldown.reset(PENDING_COOLDOWN);
+        } else if !self.pending_cooldown.is_active() {
+            self.pending_cooldown.clear();
+            if self.pending.is_some() {
+                self.learn();
+            } else {
+                self.predict(lux, luma).await;
+            }
         }
     }
 
@@ -204,7 +201,7 @@ mod tests {
         controller.process(ALS_DIM, 66).await;
 
         assert_eq!(Some(Entry::new(ALS_DIM, 66, 33)), controller.pending);
-        assert_eq!(PENDING_COOLDOWN_RESET, controller.pending_cooldown);
+        assert!(controller.pending_cooldown.is_active());
 
         Ok(())
     }
@@ -225,7 +222,7 @@ mod tests {
         controller.process(ALS_DARK, 16).await;
 
         assert_eq!(Some(Entry::new(ALS_DIM, 66, 36)), controller.pending);
-        assert_eq!(PENDING_COOLDOWN_RESET, controller.pending_cooldown);
+        assert!(controller.pending_cooldown.is_active());
 
         Ok(())
     }
@@ -242,18 +239,17 @@ mod tests {
         user_tx.send(35).await?;
         controller.process(ALS_DARK, 16).await;
 
-        for i in 1..=PENDING_COOLDOWN_RESET {
-            // User doesn't change brightness anymore, so even if lux or luma change, we are in cooldown period
-            controller.process(ALS_BRIGHT, i).await;
-            assert_eq!(PENDING_COOLDOWN_RESET - i, controller.pending_cooldown);
-            assert_eq!(Some(Entry::new(ALS_DIM, 66, 35)), controller.pending);
-        }
+        // User doesn't change brightness anymore, so even if lux or luma change, we are in cooldown period
+        controller.process(ALS_BRIGHT, 10).await;
+        assert!(controller.pending_cooldown.is_active());
+        assert_eq!(Some(Entry::new(ALS_DIM, 66, 35)), controller.pending);
 
         // One final process will trigger the learning
+        controller.pending_cooldown.finish();
         controller.process(ALS_DARK, 17).await;
 
         assert_eq!(None, controller.pending);
-        assert_eq!(0, controller.pending_cooldown);
+        assert!(!controller.pending_cooldown.is_active());
         assert_eq!(vec![Entry::new(ALS_DIM, 66, 35)], controller.data.entries);
 
         Ok(())
