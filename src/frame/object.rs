@@ -1,4 +1,4 @@
-use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::OwnedFd;
 
 pub struct Object {
     pub width: u32,
@@ -6,7 +6,7 @@ pub struct Object {
     pub num_objects: u32,
     pub format: u32,
     pub layout: Option<(u64, u32, u32)>,
-    pub fds: Vec<RawFd>,
+    fds: Vec<Option<OwnedFd>>,
     pub sizes: Vec<u32>,
 }
 
@@ -18,13 +18,21 @@ impl Object {
             num_objects,
             format,
             layout: None,
-            fds: vec![0; num_objects as usize],
+            fds: std::iter::repeat_with(|| None)
+                .take(num_objects as usize)
+                .collect(),
             sizes: vec![0; num_objects as usize],
         }
     }
 
     pub fn set_object(&mut self, index: u32, fd: OwnedFd, size: u32) {
-        self.fds[index as usize] = fd.into_raw_fd();
+        self.fds[index as usize] = Some(fd);
         self.sizes[index as usize] = size;
+    }
+
+    pub fn fd(&self, index: usize) -> &OwnedFd {
+        self.fds[index]
+            .as_ref()
+            .expect("DMA-BUF object was not provided")
     }
 }

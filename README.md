@@ -177,7 +177,6 @@ If your results do not match, please open an issue and let's investigate!
 
 Help is wanted and much appreciated! If you want to implement some of these, feel free to open an issue and I'll provide more details and try to help you along the way.
 
-- Support for frames with custom DRM modifiers (e.g. multi-planar frames) is currently not implemented. This was [implemented in mesa](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/1466) and can finally be added to `wluma`. Until then, a workaround is to export `WLR_DRM_NO_MODIFIERS=1` before launching your wlroots-based compositor.
 - Plugging in a screen while `wluma` is running. Workaround: restart `wluma`.
 
 ## Relevant projects

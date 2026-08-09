@@ -391,6 +391,11 @@ impl Dispatch<ZwlrExportDmabufFrameV1, ()> for Capturer {
                 log::trace!(
                     "wlr-export-dmabuf frame: DRM format={format}, size={width}x{height}, objects={num_objects}, modifier={modifier:#018x}"
                 );
+                if num_objects > 1 {
+                    log::error!(
+                        "The compositor sent a multi-object DMA-BUF, which wluma cannot import. Set WLR_DRM_NO_MODIFIERS=1 before launching the compositor"
+                    );
+                }
                 let mut pending_frame = Object::new(width, height, num_objects, format);
                 pending_frame.layout = Some((modifier, 0, 0));
                 state.pending_frame = Some(pending_frame);
@@ -431,6 +436,7 @@ impl Dispatch<ZwlrExportDmabufFrameV1, ()> for Capturer {
 
             Event::Cancel { reason } => {
                 log::debug!("Frame was cancelled, reason: {reason:?}");
+                state.pending_frame.take();
                 frame.destroy();
 
                 thread::sleep(DELAY_FAILURE);

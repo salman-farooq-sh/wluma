@@ -9,8 +9,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::default::Default;
 use std::ffi::{CStr, CString};
+use std::fs::File;
 use std::ops::Drop;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 
 const VULKAN_VERSION: u32 = vk::make_api_version(0, 1, 2, 0);
 
@@ -347,14 +348,14 @@ impl Vulkan {
     pub fn luma_percent_from_external_fd(&mut self, frame: &Object) -> Result<u8> {
         let (frame_image, frame_image_memory) = self.init_frame_image(frame)?;
 
-        let result = self.luma_percent(&frame_image)?;
+        let result = self.luma_percent(&frame_image);
 
         unsafe {
             self.device.destroy_image(frame_image, None);
             self.device.free_memory(frame_image_memory, None);
         }
 
-        Ok(result)
+        result
     }
 
     pub fn luma_percent_from_internal_fd(&mut self) -> Result<u8> {
@@ -614,16 +615,53 @@ impl Vulkan {
                 .map_err(anyhow::Error::msg)?
         };
 
+        // Allocate memory and bind it to the image
+        let frame_image_memory = match self.allocate_imported_frame_memory(frame, frame_image) {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe {
+                    self.device.destroy_image(frame_image, None);
+                }
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = unsafe {
+            self.device
+                .bind_image_memory(frame_image, frame_image_memory, 0)
+        } {
+            unsafe {
+                self.device.destroy_image(frame_image, None);
+                self.device.free_memory(frame_image_memory, None);
+            }
+            return Err(anyhow::Error::msg(error));
+        }
+
+        // Also ensure the internal image is initialized with the same dimensions
+        if let Err(error) = self.init_image(frame) {
+            unsafe {
+                self.device.destroy_image(frame_image, None);
+                self.device.free_memory(frame_image_memory, None);
+            }
+            return Err(error);
+        }
+
+        Ok((frame_image, frame_image_memory))
+    }
+
+    fn allocate_imported_frame_memory(
+        &self,
+        frame: &Object,
+        frame_image: vk::Image,
+    ) -> Result<vk::DeviceMemory> {
         // Memory requirements info
         let frame_image_memory_req_info =
             vk::ImageMemoryRequirementsInfo2::default().image(frame_image);
 
         // Prepare the structures to get memory requirements into, then get the memory requirements
         let mut frame_image_mem_dedicated_req = vk::MemoryDedicatedRequirements::default();
-
         let mut frame_image_mem_req =
             vk::MemoryRequirements2::default().push_next(&mut frame_image_mem_dedicated_req);
-
         unsafe {
             self.device.get_image_memory_requirements2(
                 &frame_image_memory_req_info,
@@ -631,22 +669,42 @@ impl Vulkan {
             );
         }
 
+        let object_size = File::from(frame.fd(0).try_clone()?).metadata()?.len();
+        if object_size < frame_image_mem_req.memory_requirements.size {
+            return Err(anyhow!(
+                "DMA-BUF is {object_size} bytes, Vulkan requires at least {} bytes",
+                frame_image_mem_req.memory_requirements.size
+            ));
+        }
+
         // Bit i in memory_type_bits is set if the ith memory type in the
         // VkPhysicalDeviceMemoryProperties structure is supported for the image memory.
         // We just use the first type supported (from least significant bit's side)
 
         // Find suitable memory type index
+        let mut fd_properties = vk::MemoryFdPropertiesKHR::default();
+        unsafe {
+            self.khr_device
+                .get_memory_fd_properties(
+                    vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                    frame.fd(0).as_raw_fd(),
+                    &mut fd_properties,
+                )
+                .map_err(anyhow::Error::msg)?;
+        }
         let memory_type_index = memory_type_index(
-            frame_image_mem_req.memory_requirements.memory_type_bits,
+            frame_image_mem_req.memory_requirements.memory_type_bits
+                & fd_properties.memory_type_bits,
             "imported frame image",
         )?;
+        let imported_fd = frame.fd(0).try_clone()?.into_raw_fd();
 
         // Import memory app_info
         // Construct the memory alloctation info according to the requirements
         // If the image needs dedicated memory, add MemoryDedicatedAllocateInfo to the info chain
         let mut frame_import_memory_info = vk::ImportMemoryFdInfoKHR::default()
             .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-            .fd(frame.fds[0]);
+            .fd(imported_fd);
 
         // dedicated allocation info
         let mut frame_image_memory_dedicated_info =
@@ -655,9 +713,8 @@ impl Vulkan {
         // Memory allocate info
         let mut frame_image_allocate_info = vk::MemoryAllocateInfo::default()
             .push_next(&mut frame_import_memory_info)
-            .allocation_size(frame_image_mem_req.memory_requirements.size)
+            .allocation_size(object_size)
             .memory_type_index(memory_type_index);
-
         if frame_image_mem_dedicated_req.requires_dedicated_allocation == vk::TRUE
             || frame_image_mem_dedicated_req.prefers_dedicated_allocation == vk::TRUE
         {
@@ -665,23 +722,19 @@ impl Vulkan {
                 frame_image_allocate_info.push_next(&mut frame_image_memory_dedicated_info);
         }
 
-        // Allocate memory and bind it to the image
-        let frame_image_memory = unsafe {
+        let allocation = unsafe {
             self.device
                 .allocate_memory(&frame_image_allocate_info, None)
-                .map_err(anyhow::Error::msg)?
         };
-
-        unsafe {
-            self.device
-                .bind_image_memory(frame_image, frame_image_memory, 0)
-                .map_err(anyhow::Error::msg)?;
-        };
-
-        // Also ensure the internal image is initialized with the same dimensions
-        self.init_image(frame)?;
-
-        Ok((frame_image, frame_image_memory))
+        match allocation {
+            Ok(memory) => Ok(memory),
+            Err(error) => {
+                unsafe {
+                    drop(OwnedFd::from_raw_fd(imported_fd));
+                }
+                Err(anyhow::Error::msg(error))
+            }
+        }
     }
 
     pub fn init_exportable_frame_image(
