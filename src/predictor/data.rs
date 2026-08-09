@@ -55,7 +55,7 @@ impl Data {
     }
 
     fn path(output_name: &str) -> Result<PathBuf> {
-        Ok(xdg::BaseDirectories::with_prefix("wluma")?
+        Ok(xdg::BaseDirectories::with_prefix("wluma")
             .create_data_directory("")?
             .join(format!("{:}.yaml", output_name)))
     }

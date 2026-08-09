@@ -63,8 +63,7 @@ fn match_capturer(capturer: file::Capturer) -> app::Capturer {
 
 fn parse() -> Result<app::Config, toml::de::Error> {
     let file_config = xdg::BaseDirectories::with_prefix("wluma")
-        .ok()
-        .and_then(|xdg| xdg.find_config_file("config.toml"))
+        .find_config_file("config.toml")
         .and_then(|cfg_path| fs::read_to_string(cfg_path).ok())
         .unwrap_or_else(|| include_str!("../../config.toml").to_string());
 

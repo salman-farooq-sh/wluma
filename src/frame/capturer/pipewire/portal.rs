@@ -157,7 +157,7 @@ fn restore_token(output_name: &str) -> Result<Option<String>> {
 }
 
 fn save_restore_token(output_name: &str, token: &str) -> Result<()> {
-    let path = xdg::BaseDirectories::with_prefix("wluma")?
+    let path = xdg::BaseDirectories::with_prefix("wluma")
         .place_state_file(restore_token_name(output_name))?;
     fs::write(path, token)?;
     Ok(())
@@ -172,7 +172,9 @@ fn clear_restore_token(output_name: &str) -> Result<()> {
 }
 
 fn restore_token_path(output_name: &str) -> Result<std::path::PathBuf> {
-    Ok(xdg::BaseDirectories::with_prefix("wluma")?.get_state_file(restore_token_name(output_name)))
+    xdg::BaseDirectories::with_prefix("wluma")
+        .get_state_file(restore_token_name(output_name))
+        .ok_or_else(|| anyhow!("XDG state directory is unavailable"))
 }
 
 fn restore_token_name(output_name: &str) -> String {
