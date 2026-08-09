@@ -3,7 +3,6 @@ use anyhow::{anyhow, Error, Result};
 use futures_util::{StreamExt, TryFutureExt};
 use smol::fs::{self, File};
 use smol::lock::Mutex;
-use std::collections::HashMap;
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -46,20 +45,13 @@ enum Source {
 
 pub struct Als {
     source: Source,
-    thresholds: HashMap<u64, String>,
 }
 
 impl Als {
-    pub async fn new(base_path: Option<&str>, thresholds: HashMap<u64, String>) -> Result<Self> {
+    pub async fn new(base_path: Option<&str>) -> Result<Self> {
         let source = match smol::unblock(super::sensor_proxy::Sensor::new).await {
             Ok(sensor) => {
-                if base_path.is_some() {
-                    log::warn!(
-                        "Using iio-sensor-proxy; remove the deprecated IIO 'path' from your config."
-                    );
-                } else {
-                    log::debug!("Using iio-sensor-proxy for ambient light");
-                }
+                log::debug!("Using iio-sensor-proxy for ambient light");
                 Source::SensorProxy(Mutex::new(sensor))
             }
             Err(proxy_error) => {
@@ -73,15 +65,13 @@ impl Als {
             }
         };
 
-        Ok(Self { source, thresholds })
+        Ok(Self { source })
     }
 
-    pub async fn get(&self) -> Result<String> {
-        let raw = self.get_raw().await?;
-        let profile = super::find_profile(raw, &self.thresholds);
-
-        log::trace!("ALS (iio): {} ({})", profile, raw);
-        Ok(profile)
+    pub async fn get(&self) -> Result<u64> {
+        let value = self.get_raw().await?;
+        log::trace!("ALS (iio): {value}");
+        Ok(value)
     }
 
     pub fn poll_interval(&self) -> Duration {

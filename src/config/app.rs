@@ -36,13 +36,17 @@ pub enum Capturer {
     None,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Als {
+    Auto {
+        thresholds: HashMap<u64, String>,
+    },
     Iio {
         path: Option<String>,
         thresholds: HashMap<u64, String>,
     },
     Time {
+        levels: HashMap<u64, u64>,
         thresholds: HashMap<u64, String>,
     },
     Webcam {
@@ -52,12 +56,17 @@ pub enum Als {
     None,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualPoint {
+    pub als: u64,
+    pub luma: u8,
+    pub reduction: u64,
+}
+
 #[derive(Debug, Clone)]
 pub enum Predictor {
     Adaptive,
-    Manual {
-        thresholds: HashMap<String, HashMap<u8, u64>>,
-    },
+    Manual { points: Vec<ManualPoint> },
 }
 
 #[derive(Clone, Default)]

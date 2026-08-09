@@ -4,7 +4,6 @@ use anyhow::{anyhow, Result};
 use itertools::Itertools;
 use smol::channel::{Receiver, Sender};
 use smol::lock::Mutex;
-use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 use v4l::buffer::Type;
@@ -13,7 +12,7 @@ use v4l::io::traits::CaptureStream;
 use v4l::video::Capture;
 use v4l::{Device, FourCC};
 
-const DEFAULT_LUX: u64 = 100;
+const DEFAULT_LIGHTNESS: u64 = 100;
 const CAPTURE_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct Webcam {
@@ -34,11 +33,11 @@ impl Webcam {
 
     fn step(&mut self) {
         if let Ok((rgbs, pixels)) = self.frame() {
-            let lux = compute_perceived_lightness_percent(&rgbs, false, pixels) as u64;
+            let lightness = compute_perceived_lightness_percent(&rgbs, false, pixels) as u64;
 
             self.webcam_tx
-                .send_blocking(lux) // TODO: async
-                .expect("Unable to send new webcam lux value, channel is dead");
+                .send_blocking(lightness) // TODO: async
+                .expect("Unable to send new webcam lightness value, channel is dead");
         };
 
         thread::sleep(CAPTURE_INTERVAL);
@@ -79,25 +78,21 @@ impl Webcam {
 
 pub struct Als {
     webcam_rx: Receiver<u64>,
-    thresholds: HashMap<u64, String>,
-    lux: Mutex<u64>,
+    lightness: Mutex<u64>,
 }
 
 impl Als {
-    pub fn new(webcam_rx: Receiver<u64>, thresholds: HashMap<u64, String>) -> Self {
+    pub fn new(webcam_rx: Receiver<u64>) -> Self {
         Self {
             webcam_rx,
-            thresholds,
-            lux: Mutex::new(DEFAULT_LUX),
+            lightness: Mutex::new(DEFAULT_LIGHTNESS),
         }
     }
 
-    pub async fn get(&self) -> Result<String> {
-        let raw = self.get_raw().await?;
-        let profile = super::find_profile(raw, &self.thresholds);
-
-        log::trace!("ALS (webcam): {} ({})", profile, raw);
-        Ok(profile)
+    pub async fn get(&self) -> Result<u64> {
+        let value = self.get_raw().await?;
+        log::trace!("ALS (webcam): {value}");
+        Ok(value)
     }
 
     async fn get_raw(&self) -> Result<u64> {
@@ -106,8 +101,8 @@ impl Als {
             .recv_maybe_last()
             .await
             .expect("webcam_rx closed unexpectedly")
-            .unwrap_or(*self.lux.lock_blocking());
-        *self.lux.lock_blocking() = new_value;
+            .unwrap_or(*self.lightness.lock_blocking());
+        *self.lightness.lock_blocking() = new_value;
         Ok(new_value)
     }
 }
@@ -122,7 +117,7 @@ mod tests {
 
     async fn setup() -> (Als, Sender<u64>) {
         let (webcam_tx, webcam_rx) = channel::bounded(128);
-        let als = Als::new(webcam_rx, HashMap::default());
+        let als = Als::new(webcam_rx);
         (als, webcam_tx)
     }
 
@@ -130,7 +125,7 @@ mod tests {
     async fn test_get_raw_returns_default_value_when_no_data_from_webcam() -> Result<()> {
         let (als, _) = setup().await;
 
-        assert_eq!(DEFAULT_LUX, als.get_raw().await?);
+        assert_eq!(DEFAULT_LIGHTNESS, als.get_raw().await?);
         Ok(())
     }
 

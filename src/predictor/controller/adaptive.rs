@@ -1,36 +1,41 @@
 use smol::channel::{Receiver, Sender};
 
-use super::{Cooldown, INITIAL_TIMEOUT, NEXT_ALS_COOLDOWN, PENDING_COOLDOWN};
+use super::{distance, Cooldown, INITIAL_TIMEOUT, PENDING_COOLDOWN};
 use crate::{
+    als::Scale,
     channel_ext::ReceiverExt,
     predictor::data::{Data, Entry},
 };
+use std::collections::HashMap;
+
+const REPLACEMENT_DISTANCE: f64 = 0.25;
 
 pub struct Controller {
     prediction_tx: Sender<u64>,
     user_rx: Receiver<u64>,
-    als_rx: Receiver<String>,
+    als_rx: Receiver<u64>,
     pending_cooldown: Cooldown,
     pending: Option<Entry>,
     data: Data,
     stateful: bool,
     initial_brightness: Option<u64>,
-    last_als: Option<String>,
-    next_als: Option<String>,
-    next_als_cooldown: Cooldown,
+    last_als: Option<u64>,
     output_name: String,
+    scale: Scale,
 }
 
 impl Controller {
     pub fn new(
         prediction_tx: Sender<u64>,
         user_rx: Receiver<u64>,
-        als_rx: Receiver<String>,
+        als_rx: Receiver<u64>,
         stateful: bool,
         output_name: &str,
+        scale: Scale,
+        legacy_thresholds: &HashMap<u64, String>,
     ) -> Self {
         let data = if stateful {
-            Data::load(output_name)
+            Data::load(output_name, legacy_thresholds, scale)
         } else {
             Data::new(output_name)
         };
@@ -45,9 +50,8 @@ impl Controller {
             stateful,
             initial_brightness: None,
             last_als: None,
-            next_als: None,
-            next_als_cooldown: Cooldown::default(),
             output_name: output_name.to_string(),
+            scale,
         }
     }
 
@@ -75,28 +79,20 @@ impl Controller {
             };
         }
 
-        match self
+        if let Some(als) = self
             .als_rx
             .recv_maybe_last()
             .await
             .expect("als_rx closed unexpectedly")
         {
-            new_als @ Some(_) if self.next_als != new_als => {
-                self.next_als = new_als;
-                self.next_als_cooldown.reset(NEXT_ALS_COOLDOWN);
-            }
-            _ if self.next_als_cooldown.is_finished() => {
-                self.next_als_cooldown.clear();
-                self.last_als = self.next_als.take();
-            }
-            _ => {}
+            self.last_als = Some(als);
         }
 
-        let lux = &self.last_als.clone().expect("ALS value must be known");
-        self.process(lux, luma).await;
+        let als = self.last_als.expect("ALS value must be known");
+        self.process(als, luma).await;
     }
 
-    async fn process(&mut self, lux: &str, luma: u8) {
+    async fn process(&mut self, als: u64, luma: u8) {
         let initial_brightness = self.initial_brightness.take();
         let user_changed_brightness = self
             .user_rx
@@ -107,11 +103,11 @@ impl Controller {
 
         if let Some(brightness) = user_changed_brightness {
             self.pending = match &self.pending {
-                // First time we notice user adjusting brightness, freeze lux and luma...
-                None => Some(Entry::new(lux, luma, brightness)),
+                // First time we notice user adjusting brightness, freeze ALS and luma...
+                None => Some(Entry::new(als, luma, brightness)),
                 // ... but as user keeps changing brightness,
-                // allow some time for them to reach the desired brightness level for the pending lux and luma
-                Some(Entry { lux, luma, .. }) => Some(Entry::new(lux, *luma, brightness)),
+                // allow some time for them to reach the desired brightness level for the pending ALS and luma
+                Some(Entry { als, luma, .. }) => Some(Entry::new(*als, *luma, brightness)),
             };
             // Every time user changed brightness, reset the cooldown period
             self.pending_cooldown.reset(PENDING_COOLDOWN);
@@ -120,7 +116,7 @@ impl Controller {
             if self.pending.is_some() {
                 self.learn();
             } else {
-                self.predict(lux, luma).await;
+                self.predict(als, luma).await;
             }
         }
     }
@@ -130,34 +126,30 @@ impl Controller {
         log::debug!("[{}] Learning {pending:?}", self.output_name);
 
         self.data.entries.retain(|entry| {
-            let different_env = entry.lux != pending.lux;
-
-            let same_env_darker_screen = entry.lux == pending.lux
-                && entry.luma < pending.luma
-                && entry.brightness >= pending.brightness;
-
-            let same_env_brighter_screen = entry.lux == pending.lux
-                && entry.luma > pending.luma
-                && entry.brightness <= pending.brightness;
-
-            different_env || same_env_darker_screen || same_env_brighter_screen
+            let nearby =
+                distance(self.scale, pending.als, pending.luma, entry) <= REPLACEMENT_DISTANCE;
+            let should_be_dimmer = entry.als <= pending.als && entry.luma >= pending.luma;
+            let should_be_brighter = entry.als >= pending.als && entry.luma <= pending.luma;
+            let conflict = (should_be_dimmer && entry.brightness > pending.brightness)
+                || (should_be_brighter && entry.brightness < pending.brightness);
+            !nearby && !conflict
         });
 
         self.data.entries.push(pending);
 
         self.data
             .entries
-            .sort_unstable_by(|x, y| x.lux.cmp(&y.lux).then(x.luma.cmp(&y.luma)));
+            .sort_unstable_by(|x, y| x.als.cmp(&y.als).then(x.luma.cmp(&y.luma)));
 
         if self.stateful {
             self.data.save().expect("Unable to save data");
         }
     }
 
-    async fn predict(&mut self, lux: &str, luma: u8) {
-        if let Some(prediction) = super::interpolate(&self.data.entries, lux, luma) {
+    async fn predict(&mut self, als: u64, luma: u8) {
+        if let Some(prediction) = super::interpolate(&self.data.entries, self.scale, als, luma) {
             log::trace!(
-                "[{}] Prediction: {prediction} (lux: {lux}, luma: {luma})",
+                "[{}] Prediction: {prediction} (als: {als}, luma: {luma})",
                 self.output_name
             );
             self.prediction_tx
@@ -172,23 +164,29 @@ impl Controller {
 mod tests {
     use super::*;
     use anyhow::Result;
-    use itertools::{iproduct, Itertools};
     use macro_rules_attribute::apply;
     use smol::channel;
     use smol_macros::test;
-    use std::collections::HashSet;
 
-    const ALS_DARK: &str = "dark";
-    const ALS_DIM: &str = "dim";
-    const ALS_BRIGHT: &str = "bright";
+    const ALS_DARK: u64 = 10;
+    const ALS_DIM: u64 = 20;
+    const ALS_BRIGHT: u64 = 30;
 
     async fn setup() -> Result<(Controller, Sender<u64>, Receiver<u64>)> {
         let (als_tx, als_rx) = channel::bounded(128);
         let (user_tx, user_rx) = channel::bounded(128);
         let (prediction_tx, prediction_rx) = channel::bounded(128);
-        als_tx.send(ALS_BRIGHT.to_string()).await?;
+        als_tx.send(ALS_BRIGHT).await?;
         user_tx.send(0).await?;
-        let controller = Controller::new(prediction_tx, user_rx, als_rx, false, "Dell 1");
+        let controller = Controller::new(
+            prediction_tx,
+            user_rx,
+            als_rx,
+            false,
+            "Dell 1",
+            Scale::Linear,
+            &HashMap::new(),
+        );
         Ok((controller, user_tx, prediction_rx))
     }
 
@@ -196,7 +194,7 @@ mod tests {
     async fn test_process_first_user_change() -> Result<()> {
         let (mut controller, user_tx, _) = setup().await?;
 
-        // User changes brightness to value 33 for a given lux and luma
+        // User changes brightness to value 33 for a given ALS and luma
         user_tx.send(33).await?;
         controller.process(ALS_DIM, 66).await;
 
@@ -210,13 +208,13 @@ mod tests {
     async fn test_process_several_continuous_user_changes() -> Result<()> {
         let (mut controller, user_tx, _) = setup().await?;
 
-        // User initiates brightness change for a given lux and luma to value 33...
+        // User initiates brightness change for a given ALS and luma to value 33...
         user_tx.send(33).await?;
         controller.process(ALS_DIM, 66).await;
-        // then quickly continues increasing it to 34 (while lux and luma might already be different)...
+        // then quickly continues increasing it to 34 (while ALS and luma might already be different)...
         user_tx.send(34).await?;
         controller.process(ALS_BRIGHT, 36).await;
-        // and even faster to 36 (which is the indended brightness value they wish to learn for the initial lux and luma)
+        // and even faster to 36 (which is the indended brightness value they wish to learn for the initial ALS and luma)
         user_tx.send(35).await?;
         user_tx.send(36).await?;
         controller.process(ALS_DARK, 16).await;
@@ -239,7 +237,7 @@ mod tests {
         user_tx.send(35).await?;
         controller.process(ALS_DARK, 16).await;
 
-        // User doesn't change brightness anymore, so even if lux or luma change, we are in cooldown period
+        // User doesn't change brightness anymore, so even if ALS or luma change, we are in cooldown period
         controller.process(ALS_BRIGHT, 10).await;
         assert!(controller.pending_cooldown.is_active());
         assert_eq!(Some(Entry::new(ALS_DIM, 66, 35)), controller.pending);
@@ -262,58 +260,33 @@ mod tests {
     // | darker screen   | any             | same or brighter | same or brighter |
     // | same screen     | same or dimmer  | only same        | same or brighter |
     // | brighter screen | same or dimmer  | same or dimmer   | any              |
-    //
-    // *UPDATE*: experimenting with not changing other envs
 
     #[apply(test!)]
     async fn test_learn_data_cleanup() -> Result<()> {
         let (mut controller, _, _) = setup().await?;
-
-        let pending = Entry::new(ALS_DIM, 20, 30);
-
-        let all_als = [ALS_DARK, ALS_DIM, ALS_BRIGHT];
-        let all_combinations: HashSet<_> = iproduct!(-1i32..=1, -1i32..=1, -1i32..=1)
-            .map(|(i, j, k)| Entry::new(all_als[(1 + i) as usize], (20 + j) as u8, (30 + k) as u64))
-            .collect();
-
-        let to_be_deleted: HashSet<_> = vec![
-            // same env darker screen
-            Entry::new(ALS_DIM, 19, 29),
-            // same env same screen
-            Entry::new(ALS_DIM, 20, 29),
-            Entry::new(ALS_DIM, 20, 31),
-            // same env brighter screen
-            Entry::new(ALS_DIM, 21, 31),
-        ]
-        .into_iter()
-        .collect();
-
-        controller.data.entries = all_combinations.iter().cloned().collect_vec();
-        controller.pending = Some(pending);
+        controller.data.entries = vec![
+            Entry::new(21, 20, 30),
+            Entry::new(10, 30, 31),
+            Entry::new(30, 10, 29),
+            Entry::new(10, 30, 29),
+            Entry::new(30, 10, 31),
+            Entry::new(10, 10, 30),
+            Entry::new(30, 30, 30),
+        ];
+        controller.pending = Some(Entry::new(ALS_DIM, 20, 30));
 
         controller.learn();
 
-        let to_remain: HashSet<_> = all_combinations.difference(&to_be_deleted).collect();
-        let remained = controller.data.entries.iter().collect();
-
         assert_eq!(
-            Vec::<&&Entry>::new(),
-            to_remain.difference(&remained).collect_vec(),
-            "unexpected entries were removed"
+            vec![
+                Entry::new(10, 10, 30),
+                Entry::new(10, 30, 29),
+                Entry::new(20, 20, 30),
+                Entry::new(30, 10, 31),
+                Entry::new(30, 30, 30),
+            ],
+            controller.data.entries
         );
-
-        assert_eq!(
-            Vec::<&&Entry>::new(),
-            remained.difference(&to_remain).collect_vec(),
-            "some entries were not removed"
-        );
-
-        assert_eq!(
-            to_remain.len(),
-            controller.data.entries.len(),
-            "duplicate entries remained"
-        );
-
         Ok(())
     }
 
@@ -331,14 +304,11 @@ mod tests {
     }
 
     #[apply(test!)]
-    async fn test_predict_no_data_points_for_current_als_profile() -> Result<()> {
+    async fn test_predict_rejects_distant_data() -> Result<()> {
         let (mut controller, _, prediction_rx) = setup().await?;
-        controller.data.entries = vec![
-            Entry::new(ALS_DARK, 50, 100),
-            Entry::new(ALS_BRIGHT, 60, 100),
-        ];
+        controller.data.entries = vec![Entry::new(100, 100, 100)];
 
-        // predict() should not be called with no data, but just in case confirm we don't panic
+        // predict() should not be called with no nearby data, but just in case confirm we don't panic
         controller.predict(ALS_DIM, 20).await;
 
         assert!(prediction_rx.try_recv().is_err());
@@ -388,7 +358,7 @@ mod tests {
     }
 
     #[apply(test!)]
-    async fn test_predict_only_uses_data_for_current_als_profile() -> Result<()> {
+    async fn test_predict_uses_local_continuous_data() -> Result<()> {
         let (mut controller, _, prediction_rx) = setup().await?;
         controller.data.entries = vec![
             Entry::new(ALS_DIM, 10, 15),
@@ -400,7 +370,7 @@ mod tests {
 
         controller.predict(ALS_DIM, 50).await;
 
-        assert_eq!(43, prediction_rx.try_recv()?);
+        assert_eq!(83, prediction_rx.try_recv()?);
         Ok(())
     }
 }

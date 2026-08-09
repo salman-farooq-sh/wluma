@@ -33,14 +33,15 @@ pub enum Capturer {
 pub enum Als {
     Iio {
         path: Option<String>,
-        thresholds: HashMap<String, String>,
+        thresholds: Option<HashMap<String, String>>,
     },
     Time {
-        thresholds: HashMap<String, String>,
+        levels: Option<HashMap<String, u64>>,
+        thresholds: Option<HashMap<String, String>>,
     },
     Webcam {
         video: usize,
-        thresholds: HashMap<String, String>,
+        thresholds: Option<HashMap<String, String>>,
     },
     None,
 }
@@ -52,13 +53,22 @@ pub struct OutputByType {
     pub ddcutil: Vec<DdcUtilOutput>,
 }
 
+#[derive(Deserialize, Debug)]
+pub struct ManualPoint {
+    pub als: u64,
+    pub luma: u8,
+    pub reduction: u64,
+}
+
 #[derive(Deserialize, Debug, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Predictor {
     #[default]
     Adaptive,
     Manual {
-        thresholds: HashMap<String, HashMap<String, u64>>,
+        #[serde(default)]
+        points: Vec<ManualPoint>,
+        thresholds: Option<HashMap<String, HashMap<String, u64>>>,
     },
 }
 
@@ -86,9 +96,9 @@ pub struct Keyboard {
     pub path: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
 pub struct Config {
-    pub als: Als,
+    pub als: Option<Als>,
     #[serde(default)]
     pub output: OutputByType,
     #[serde(default)]

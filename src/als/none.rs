@@ -4,7 +4,7 @@ use anyhow::Result;
 pub struct Als {}
 
 impl Als {
-    pub async fn get(&self) -> Result<String> {
-        Ok("none".to_string())
+    pub async fn get(&self) -> Result<u64> {
+        Ok(0)
     }
 }
