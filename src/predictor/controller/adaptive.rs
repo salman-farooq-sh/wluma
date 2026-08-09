@@ -349,11 +349,11 @@ mod tests {
 
         // Approximated using weighted distance to all known points:
         // dist1 = sqrt((x1 - x2)^2 + (y1 - y2)^2)
-        // weight1 = (1/dist1) / (1/dist1 + 1/dist2 + 1/dist3)
+        // weight1 = (1/dist1^2) / (1/dist1^2 + 1/dist2^2 + 1/dist3^2)
         // prediction = weight1*brightness1 + weight2*brightness2 + weight3*brightness
         controller.predict(ALS_DIM, 50).await;
 
-        assert_eq!(43, prediction_rx.try_recv()?);
+        assert_eq!(38, prediction_rx.try_recv()?);
         Ok(())
     }
 
@@ -370,7 +370,7 @@ mod tests {
 
         controller.predict(ALS_DIM, 50).await;
 
-        assert_eq!(83, prediction_rx.try_recv()?);
+        assert_eq!(94, prediction_rx.try_recv()?);
         Ok(())
     }
 }

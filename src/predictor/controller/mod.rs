@@ -68,14 +68,14 @@ fn interpolate(entries: &[Entry], scale: Scale, als: u64, luma: u8) -> Option<u6
     }
     let total_weight = points
         .iter()
-        .map(|(_, distance)| 1.0 / distance)
+        .map(|(_, distance)| 1.0 / distance.powi(2))
         .sum::<f64>();
     if total_weight == 0.0 {
         return None;
     }
     let prediction = points
         .iter()
-        .map(|(brightness, distance)| brightness / distance / total_weight)
+        .map(|(brightness, distance)| brightness / distance.powi(2) / total_weight)
         .sum::<f64>();
     Some(prediction as u64)
 }

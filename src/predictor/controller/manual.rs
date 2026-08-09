@@ -161,15 +161,15 @@ mod tests {
         let (mut controller, _, _) = setup().await?;
 
         assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 0), 0);
-        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 10), 10);
-        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 20), 18);
-        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 30), 24);
-        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 40), 28);
+        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 10), 2);
+        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 20), 11);
+        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 30), 22);
+        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 40), 29);
         assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 50), 30);
-        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 60), 31);
-        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 70), 35);
-        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 80), 41);
-        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 90), 49);
+        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 60), 30);
+        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 70), 37);
+        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 80), 48);
+        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 90), 57);
         assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 100), 60);
 
         Ok(())
@@ -207,10 +207,10 @@ mod tests {
         assert_eq!(prediction_rx.recv().await?, 100);
 
         controller.process(ALS_DIM, 10).await;
-        assert_eq!(prediction_rx.recv().await?, 120);
+        assert_eq!(prediction_rx.recv().await?, 128);
 
         controller.process(ALS_DIM, 80).await;
-        assert_eq!(prediction_rx.recv().await?, 89);
+        assert_eq!(prediction_rx.recv().await?, 82);
 
         Ok(())
     }
