@@ -574,7 +574,7 @@ impl Vulkan {
         }
         let plane_layouts = [vk::SubresourceLayout {
             offset: offset as u64,
-            size: frame.sizes[0] as u64,
+            size: 0,
             row_pitch: stride as u64,
             array_pitch: 0,
             depth_pitch: 0,
