@@ -14,7 +14,7 @@ use v4l::video::Capture;
 use v4l::{Device, FourCC};
 
 const DEFAULT_LUX: u64 = 100;
-const WAITING_SLEEP_MS: u64 = 2000;
+const CAPTURE_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct Webcam {
     webcam_tx: Sender<u64>,
@@ -41,7 +41,7 @@ impl Webcam {
                 .expect("Unable to send new webcam lux value, channel is dead");
         };
 
-        thread::sleep(Duration::from_millis(WAITING_SLEEP_MS));
+        thread::sleep(CAPTURE_INTERVAL);
     }
 
     fn frame(&mut self) -> Result<(Vec<u8>, usize)> {

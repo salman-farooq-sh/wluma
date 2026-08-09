@@ -2,9 +2,6 @@ use smol::channel::Sender;
 use smol::Timer;
 
 use super::Als;
-use std::time::Duration;
-
-const WAITING_SLEEP_MS: u64 = 100;
 
 pub struct Controller {
     als: Als,
@@ -34,6 +31,6 @@ impl Controller {
             Err(err) => log::error!("Unable to get ALS value: {:?}", err),
         };
 
-        Timer::after(Duration::from_millis(WAITING_SLEEP_MS)).await;
+        Timer::after(self.als.poll_interval()).await;
     }
 }

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use itertools::Itertools;
 use std::collections::HashMap;
+use std::time::Duration;
 
 pub mod controller;
 pub mod iio;
@@ -8,6 +9,8 @@ pub mod none;
 mod sensor_proxy;
 pub mod time;
 pub mod webcam;
+
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[allow(clippy::large_enum_variant)]
 pub enum Als {
@@ -24,6 +27,13 @@ impl Als {
             Als::Iio(als) => als.get().await,
             Als::Time(als) => als.get().await,
             Als::None(als) => als.get().await,
+        }
+    }
+
+    pub fn poll_interval(&self) -> Duration {
+        match self {
+            Als::Iio(als) => als.poll_interval(),
+            Als::Webcam(_) | Als::Time(_) | Als::None(_) => DEFAULT_POLL_INTERVAL,
         }
     }
 }

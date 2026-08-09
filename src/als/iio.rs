@@ -6,7 +6,11 @@ use smol::lock::Mutex;
 use std::collections::HashMap;
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use SensorType::*;
+
+const SENSOR_PROXY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const SYSFS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[allow(clippy::large_enum_variant)]
 enum SensorType {
@@ -65,6 +69,13 @@ impl Als {
 
         log::trace!("ALS (iio): {} ({})", profile, raw);
         Ok(profile)
+    }
+
+    pub fn poll_interval(&self) -> Duration {
+        match &self.source {
+            Source::SensorProxy(_) => SENSOR_PROXY_POLL_INTERVAL,
+            Source::Sysfs(_) => SYSFS_POLL_INTERVAL,
+        }
     }
 
     async fn get_raw(&self) -> Result<u64> {
