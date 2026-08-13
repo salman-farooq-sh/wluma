@@ -74,14 +74,24 @@ The `config.toml` in repository represents default config values. To change them
 
 ### ALS
 
-When ALS configuration is omitted, wluma automatically uses an IIO ambient light sensor when one is available and otherwise continues without one. It first tries `iio-sensor-proxy` over the system D-Bus and then direct IIO discovery under `/sys/bus/iio/devices`.
+When ALS configuration is omitted, wluma first uses an external ALS if `$XDG_RUNTIME_DIR/wluma/als.sock` is a Unix socket, then an IIO ambient light sensor when one is available, and otherwise continues without one. For IIO it first tries `iio-sensor-proxy` over the system D-Bus and then direct IIO discovery under `/sys/bus/iio/devices`.
 
-Explicit `[als.iio]`, `[als.webcam]`, `[als.time]` and `[als.none]` sections override automatic selection. The IIO `path` enables direct polling from a different sysfs directory when `iio-sensor-proxy` is unavailable.
+Explicit `[als.external]`, `[als.iio]`, `[als.webcam]`, `[als.time]` and `[als.none]` sections override automatic selection. The IIO `path` enables direct polling from a different sysfs directory when `iio-sensor-proxy` is unavailable.
 
 ```toml
 [als.iio]
 path = "/sys/bus/iio/devices"
 ```
+
+An external ALS is a Unix stream socket server that sends one non-negative decimal value per line. It should send values as soon as they become available and at least once every two seconds, including when unchanged. The path defaults to `$XDG_RUNTIME_DIR/wluma/als.sock` and the scale defaults to `lux`:
+
+```toml
+[als.external]
+path = "/run/user/1000/home-assistant/als.sock"
+scale = "linear"
+```
+
+The `lux` scale accepts illuminance values without an upper bound. The `linear` scale accepts normalized values from 0 to 100. The socket must exist before wluma starts for automatic detection.
 
 Webcam ALS reports perceived camera-frame lightness from 0 to 100. Time ALS uses a circular, linearly interpolated schedule of synthetic light levels:
 

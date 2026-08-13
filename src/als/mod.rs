@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::time::Duration;
 
 pub mod controller;
+pub mod external;
 pub mod iio;
 pub mod none;
 mod sensor_proxy;
@@ -44,6 +45,7 @@ pub struct Reading {
 #[allow(clippy::large_enum_variant)]
 pub enum Als {
     Webcam(webcam::Als),
+    External(external::Als),
     Iio(iio::Als),
     Time(time::Als),
     None(none::Als),
@@ -53,6 +55,7 @@ impl Als {
     pub async fn get(&self) -> Result<Option<u64>> {
         match self {
             Self::Webcam(als) => als.get().await,
+            Self::External(als) => als.get().await.map(Some),
             Self::Iio(als) => als.get().await.map(Some),
             Self::Time(als) => als.get().await.map(Some),
             Self::None(als) => als.get().await.map(Some),
@@ -61,6 +64,7 @@ impl Als {
 
     pub fn poll_interval(&self) -> Duration {
         match self {
+            Self::External(als) => als.poll_interval(),
             Self::Iio(als) => als.poll_interval(),
             Self::Webcam(_) | Self::Time(_) | Self::None(_) => DEFAULT_POLL_INTERVAL,
         }
@@ -68,6 +72,7 @@ impl Als {
 
     pub fn scale(&self) -> Scale {
         match self {
+            Self::External(als) => als.scale(),
             Self::Iio(_) => Scale::Lux,
             Self::Webcam(_) | Self::Time(_) | Self::None(_) => Scale::Linear,
         }

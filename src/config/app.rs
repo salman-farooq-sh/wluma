@@ -41,6 +41,11 @@ pub enum Als {
     Auto {
         thresholds: HashMap<u64, String>,
     },
+    External {
+        path: String,
+        scale: crate::als::Scale,
+        thresholds: HashMap<u64, String>,
+    },
     Iio {
         path: Option<String>,
         thresholds: HashMap<u64, String>,
@@ -60,6 +65,11 @@ impl fmt::Debug for Als {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Auto { .. } => f.debug_struct("Auto").finish(),
+            Self::External { path, scale, .. } => f
+                .debug_struct("External")
+                .field("path", path)
+                .field("scale", scale)
+                .finish(),
             Self::Iio { path, .. } => f.debug_struct("Iio").field("path", path).finish(),
             Self::Time { levels, .. } => f.debug_struct("Time").field("levels", levels).finish(),
             Self::Webcam { video, .. } => f.debug_struct("Webcam").field("video", video).finish(),

@@ -120,6 +120,7 @@ pub struct Controller {
     als: Als,
     value_txs: Vec<Sender<Reading>>,
     stabilizer: Stabilizer,
+    last_observation: Option<Instant>,
 }
 
 impl Controller {
@@ -129,6 +130,7 @@ impl Controller {
             als,
             value_txs,
             stabilizer,
+            last_observation: None,
         }
     }
 
@@ -139,12 +141,17 @@ impl Controller {
     }
 
     async fn step(&mut self) {
+        let started = Instant::now();
         match self.als.get().await {
             Ok(Some(value)) => {
-                if let Some(reading) =
-                    self.stabilizer
-                        .observe(value, self.als.poll_interval(), Instant::now())
-                {
+                let now = Instant::now();
+                let interval = self
+                    .last_observation
+                    .replace(now)
+                    .map_or(self.als.poll_interval(), |previous| {
+                        now.duration_since(previous)
+                    });
+                if let Some(reading) = self.stabilizer.observe(value, interval, now) {
                     futures_util::future::try_join_all(
                         self.value_txs.iter().map(|channel| channel.send(reading)),
                     )
@@ -156,7 +163,9 @@ impl Controller {
             Err(error) => log::error!("Unable to get ALS value: {error:?}"),
         }
 
-        Timer::after(self.als.poll_interval()).await;
+        if let Some(remaining) = self.als.poll_interval().checked_sub(started.elapsed()) {
+            Timer::after(remaining).await;
+        }
     }
 }
 

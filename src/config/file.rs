@@ -28,9 +28,22 @@ pub enum Capturer {
     None,
 }
 
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AlsScale {
+    #[default]
+    Lux,
+    Linear,
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum Als {
+    External {
+        path: Option<String>,
+        #[serde(default)]
+        scale: AlsScale,
+    },
     Iio {
         path: Option<String>,
         thresholds: Option<HashMap<String, String>>,

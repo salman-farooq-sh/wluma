@@ -48,6 +48,9 @@ async fn main() {
         config::Als::Auto { thresholds } | config::Als::Iio { thresholds, .. } => {
             (als::Scale::Lux, thresholds.clone())
         }
+        config::Als::External {
+            scale, thresholds, ..
+        } => (*scale, thresholds.clone()),
         config::Als::Webcam { thresholds, .. } | config::Als::Time { thresholds, .. } => {
             (als::Scale::Linear, thresholds.clone())
         }
@@ -182,6 +185,9 @@ async fn main() {
                 als::Als::None(Default::default())
             }
         },
+        config::Als::External { path, scale, .. } => {
+            als::Als::External(als::external::Als::new(path, scale))
+        }
         config::Als::Iio { path, .. } => als::Als::Iio(
             als::iio::Als::new(path.as_deref())
                 .await

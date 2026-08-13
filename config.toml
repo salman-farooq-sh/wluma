@@ -1,3 +1,7 @@
+# [als.external]
+# path = "/run/user/1000/wluma/als.sock"
+# scale = "lux"
+
 # [als.iio]
 # path = "/sys/bus/iio/devices"
 

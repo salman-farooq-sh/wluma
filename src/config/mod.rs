@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
+use std::os::unix::fs::FileTypeExt;
+use std::path::PathBuf;
 mod app;
 mod discovery;
 mod file;
@@ -9,8 +11,31 @@ pub use app::*;
 
 pub fn load() -> Result<app::Config> {
     let mut config = parse()?;
+    if let app::Als::Auto { thresholds } = &config.als {
+        if let Some(path) = external_socket_path().filter(|path| {
+            path.metadata()
+                .is_ok_and(|metadata| metadata.file_type().is_socket())
+        }) {
+            log::info!("Using external ALS at '{}'", path.display());
+            config.als = app::Als::External {
+                path: path.to_string_lossy().into_owned(),
+                scale: crate::als::Scale::Lux,
+                thresholds: thresholds.clone(),
+            };
+        }
+    }
     config.output = discovery::merge(config.output, discovery::outputs());
     validate(config)
+}
+
+fn external_socket_path() -> Option<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR").map(|dir| PathBuf::from(dir).join("wluma/als.sock"))
+}
+
+fn default_external_path() -> Result<String> {
+    external_socket_path()
+        .map(|path| path.to_string_lossy().into_owned())
+        .ok_or_else(|| anyhow!("External ALS requires 'path' when XDG_RUNTIME_DIR is not set"))
 }
 
 fn match_predictor(predictor: file::Predictor) -> Result<app::Predictor> {
@@ -49,9 +74,19 @@ fn match_predictor(predictor: file::Predictor) -> Result<app::Predictor> {
 
 fn validate_manual_points(als: &app::Als, output: &[app::Output]) -> Result<()> {
     let limit = match als {
-        app::Als::Webcam { .. } | app::Als::Time { .. } => Some(100),
+        app::Als::External {
+            scale: crate::als::Scale::Linear,
+            ..
+        }
+        | app::Als::Webcam { .. }
+        | app::Als::Time { .. } => Some(100),
         app::Als::None => Some(0),
-        app::Als::Auto { .. } | app::Als::Iio { .. } => None,
+        app::Als::Auto { .. }
+        | app::Als::External {
+            scale: crate::als::Scale::Lux,
+            ..
+        }
+        | app::Als::Iio { .. } => None,
     };
     let Some(limit) = limit else {
         return Ok(());
@@ -223,6 +258,21 @@ fn parse_config_str(file_config: &str) -> Result<app::Config> {
         None => app::Als::Auto {
             thresholds: default_iio_thresholds(),
         },
+        Some(file::Als::External { path, scale }) => {
+            let scale = match scale {
+                file::AlsScale::Lux => crate::als::Scale::Lux,
+                file::AlsScale::Linear => crate::als::Scale::Linear,
+            };
+            app::Als::External {
+                path: path.map_or_else(default_external_path, Ok)?,
+                scale,
+                thresholds: if scale == crate::als::Scale::Lux {
+                    default_iio_thresholds()
+                } else {
+                    HashMap::new()
+                },
+            }
+        }
         Some(file::Als::Iio { path, thresholds }) => {
             if thresholds.is_some() {
                 log::warn!("ALS thresholds are obsolete and are only used to migrate learned data");
@@ -322,6 +372,45 @@ mod tests {
         assert!(!debug.contains("thresholds"));
         assert!(!debug.contains("\"night\""));
         assert!(matches!(config.als, app::Als::Auto { .. }));
+    }
+
+    #[test]
+    fn test_external_defaults_to_lux() {
+        let config = parse_config_str(
+            r#"
+[als.external]
+path = "/tmp/als.sock"
+"#,
+        )
+        .unwrap();
+
+        match config.als {
+            app::Als::External { path, scale, .. } => {
+                assert_eq!(path, "/tmp/als.sock");
+                assert_eq!(scale, crate::als::Scale::Lux);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_external_scale_can_be_configured() {
+        let config = parse_config_str(
+            r#"
+[als.external]
+path = "/tmp/als.sock"
+scale = "linear"
+"#,
+        )
+        .unwrap();
+
+        match config.als {
+            app::Als::External { path, scale, .. } => {
+                assert_eq!(path, "/tmp/als.sock");
+                assert_eq!(scale, crate::als::Scale::Linear);
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]
