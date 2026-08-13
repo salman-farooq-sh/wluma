@@ -36,6 +36,8 @@ pub struct Capturer {
     vulkan: Option<Vulkan>,
     output: Option<WlOutput>,
     output_global_id: Option<u32>,
+    output_match: Option<OutputMatch>,
+    output_match_ambiguous: bool,
     pending_frame: Option<Object>,
     dmabuf_formats: Vec<(u32, Vec<u64>)>,
     controller: Option<Controller>,
@@ -59,6 +61,20 @@ struct GlobalsContext {
     desired_output: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum OutputMatch {
+    Substring,
+    Exact,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MatchAction {
+    Select,
+    Replace,
+    Ambiguous,
+    Ignore,
+}
+
 impl Capturer {
     pub fn new(protocol: WaylandProtocol) -> Self {
         Self {
@@ -67,6 +83,8 @@ impl Capturer {
             vulkan: None,
             output: None,
             output_global_id: None,
+            output_match: None,
+            output_match_ambiguous: false,
             pending_frame: None,
             dmabuf_formats: Vec::new(),
             controller: None,
@@ -139,6 +157,8 @@ impl Capturer {
                 "Unable to match config '{}' to any Wayland output.",
                 output_name,
             );
+        } else if self.output_match_ambiguous {
+            log::error!("Multiple Wayland outputs match config '{}'.", output_name);
         }
 
         let protocol_to_use = match self.protocol {
@@ -265,6 +285,29 @@ impl Capturer {
 
 // ==== Globals ====
 
+fn output_match(value: &str, desired_output: &str, exact: bool) -> Option<OutputMatch> {
+    if desired_output.is_empty() || !value.contains(desired_output) {
+        None
+    } else if exact && value == desired_output {
+        Some(OutputMatch::Exact)
+    } else {
+        Some(OutputMatch::Substring)
+    }
+}
+
+fn match_action(
+    current: Option<OutputMatch>,
+    candidate: OutputMatch,
+    same_output: bool,
+) -> MatchAction {
+    match current {
+        None => MatchAction::Select,
+        Some(current) if candidate > current => MatchAction::Replace,
+        Some(current) if candidate == current && !same_output => MatchAction::Ambiguous,
+        _ => MatchAction::Ignore,
+    }
+}
+
 impl Dispatch<WlOutput, GlobalsContext> for Capturer {
     fn event(
         state: &mut Self,
@@ -276,22 +319,44 @@ impl Dispatch<WlOutput, GlobalsContext> for Capturer {
     ) {
         use wayland_client::protocol::wl_output::Event;
 
-        match event {
-            Event::Description { description } if description.contains(&ctx.desired_output) => {
-                if state.output.is_none() {
+        let candidate = match event {
+            Event::Name { name } => {
+                output_match(&name, &ctx.desired_output, true).map(|quality| (name, quality))
+            }
+            Event::Description { description } => {
+                output_match(&description, &ctx.desired_output, false)
+                    .map(|quality| (description, quality))
+            }
+            _ => None,
+        };
+
+        if let Some((value, quality)) = candidate {
+            let same_output = state.output.as_ref() == Some(output);
+            match match_action(state.output_match, quality, same_output) {
+                MatchAction::Select => {
                     log::debug!(
                         "Using output '{}' for config '{}'",
-                        description,
+                        value,
                         ctx.desired_output,
                     );
                     state.output = Some(output.clone());
                     state.output_global_id = ctx.global_id;
-                } else {
-                    log::error!("Cannot use output '{}' for config '{}' because another output was already matched with it, skipping this output.", description, ctx.desired_output);
+                    state.output_match = Some(quality);
                 }
+                MatchAction::Replace => {
+                    log::debug!(
+                        "Using output '{}' for config '{}' instead of a less specific match",
+                        value,
+                        ctx.desired_output,
+                    );
+                    state.output = Some(output.clone());
+                    state.output_global_id = ctx.global_id;
+                    state.output_match = Some(quality);
+                    state.output_match_ambiguous = false;
+                }
+                MatchAction::Ambiguous => state.output_match_ambiguous = true,
+                MatchAction::Ignore => {}
             }
-
-            _ => {}
         }
     }
 }
@@ -370,6 +435,8 @@ impl Dispatch<WlRegistry, GlobalsContext> for Capturer {
                 log::debug!("Disconnected screen {}", ctx.desired_output);
                 state.output = None;
                 state.output_global_id = None;
+                state.output_match = None;
+                state.output_match_ambiguous = false;
             }
             _ => {}
         }
@@ -848,5 +915,64 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for Capturer {
 
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{match_action, output_match, MatchAction, OutputMatch};
+
+    #[test]
+    fn ranks_exact_names_above_substrings() {
+        assert_eq!(output_match("DP-1", "DP-1", true), Some(OutputMatch::Exact));
+        assert_eq!(
+            output_match("eDP-1", "DP-1", true),
+            Some(OutputMatch::Substring)
+        );
+        assert_eq!(
+            output_match("BNQ BenQ PD3225U", "PD3225", false),
+            Some(OutputMatch::Substring)
+        );
+    }
+
+    #[test]
+    fn descriptions_are_substring_matches() {
+        assert_eq!(
+            output_match("DP-1", "DP-1", false),
+            Some(OutputMatch::Substring)
+        );
+    }
+
+    #[test]
+    fn does_not_match_an_empty_output_name() {
+        assert_eq!(output_match("Some display (DP-1)", "", false), None);
+    }
+
+    #[test]
+    fn ignores_a_later_edp_substring_after_an_exact_dp_match() {
+        assert_eq!(
+            match_action(Some(OutputMatch::Exact), OutputMatch::Substring, false),
+            MatchAction::Ignore
+        );
+    }
+
+    #[test]
+    fn replaces_a_substring_with_a_later_exact_match() {
+        assert_eq!(
+            match_action(Some(OutputMatch::Substring), OutputMatch::Exact, false),
+            MatchAction::Replace
+        );
+    }
+
+    #[test]
+    fn detects_equally_specific_matches_from_different_outputs() {
+        assert_eq!(
+            match_action(Some(OutputMatch::Substring), OutputMatch::Substring, false),
+            MatchAction::Ambiguous
+        );
+        assert_eq!(
+            match_action(Some(OutputMatch::Substring), OutputMatch::Substring, true),
+            MatchAction::Ignore
+        );
     }
 }
