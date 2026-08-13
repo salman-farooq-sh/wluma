@@ -2,7 +2,7 @@ use smol::channel::{Receiver, Sender};
 
 use super::{distance, Cooldown, INITIAL_TIMEOUT, PENDING_COOLDOWN};
 use crate::{
-    als::Scale,
+    als::{Reading, Scale},
     channel_ext::ReceiverExt,
     predictor::data::{Data, Entry},
 };
@@ -13,13 +13,13 @@ const REPLACEMENT_DISTANCE: f64 = 0.25;
 pub struct Controller {
     prediction_tx: Sender<u64>,
     user_rx: Receiver<u64>,
-    als_rx: Receiver<u64>,
+    als_rx: Receiver<Reading>,
     pending_cooldown: Cooldown,
     pending: Option<Entry>,
     data: Data,
     stateful: bool,
     initial_brightness: Option<u64>,
-    last_als: Option<u64>,
+    last_als: Option<Reading>,
     output_name: String,
     scale: Scale,
 }
@@ -28,7 +28,7 @@ impl Controller {
     pub fn new(
         prediction_tx: Sender<u64>,
         user_rx: Receiver<u64>,
-        als_rx: Receiver<u64>,
+        als_rx: Receiver<Reading>,
         stateful: bool,
         output_name: &str,
         scale: Scale,
@@ -88,11 +88,23 @@ impl Controller {
             self.last_als = Some(als);
         }
 
-        let als = self.last_als.expect("ALS value must be known");
-        self.process(als, luma).await;
+        let reading = self.last_als.expect("ALS value must be known");
+        self.process_reading(reading, luma).await;
     }
 
+    #[cfg(test)]
     async fn process(&mut self, als: u64, luma: u8) {
+        self.process_reading(
+            Reading {
+                value: als,
+                stable: true,
+            },
+            luma,
+        )
+        .await;
+    }
+
+    async fn process_reading(&mut self, reading: Reading, luma: u8) {
         let initial_brightness = self.initial_brightness.take();
         let user_changed_brightness = self
             .user_rx
@@ -103,21 +115,30 @@ impl Controller {
 
         if let Some(brightness) = user_changed_brightness {
             self.pending = match &self.pending {
-                // First time we notice user adjusting brightness, freeze ALS and luma...
-                None => Some(Entry::new(als, luma, brightness)),
-                // ... but as user keeps changing brightness,
-                // allow some time for them to reach the desired brightness level for the pending ALS and luma
-                Some(Entry { als, luma, .. }) => Some(Entry::new(*als, *luma, brightness)),
+                None => Some(Entry::new(reading.value, luma, brightness)),
+                Some(Entry { als, .. }) => Some(Entry::new(
+                    if reading.stable { reading.value } else { *als },
+                    luma,
+                    brightness,
+                )),
             };
-            // Every time user changed brightness, reset the cooldown period
             self.pending_cooldown.reset(PENDING_COOLDOWN);
+            return;
+        }
+
+        if !reading.stable {
+            return;
+        }
+
+        if let Some(pending) = self.pending.as_mut() {
+            pending.als = reading.value;
+            if !self.pending_cooldown.is_active() {
+                self.pending_cooldown.clear();
+                self.learn();
+            }
         } else if !self.pending_cooldown.is_active() {
             self.pending_cooldown.clear();
-            if self.pending.is_some() {
-                self.learn();
-            } else {
-                self.predict(als, luma).await;
-            }
+            self.predict(reading.value, luma).await;
         }
     }
 
@@ -176,7 +197,12 @@ mod tests {
         let (als_tx, als_rx) = channel::bounded(128);
         let (user_tx, user_rx) = channel::bounded(128);
         let (prediction_tx, prediction_rx) = channel::bounded(128);
-        als_tx.send(ALS_BRIGHT).await?;
+        als_tx
+            .send(Reading {
+                value: ALS_BRIGHT,
+                stable: true,
+            })
+            .await?;
         user_tx.send(0).await?;
         let controller = Controller::new(
             prediction_tx,
@@ -219,7 +245,7 @@ mod tests {
         user_tx.send(36).await?;
         controller.process(ALS_DARK, 16).await;
 
-        assert_eq!(Some(Entry::new(ALS_DIM, 66, 36)), controller.pending);
+        assert_eq!(Some(Entry::new(ALS_DARK, 16, 36)), controller.pending);
         assert!(controller.pending_cooldown.is_active());
 
         Ok(())
@@ -233,23 +259,87 @@ mod tests {
         user_tx.send(33).await?;
         controller.process(ALS_DIM, 66).await;
         user_tx.send(33).await?;
-        controller.process(ALS_BRIGHT, 36).await;
+        controller.process(ALS_BRIGHT, 64).await;
         user_tx.send(35).await?;
-        controller.process(ALS_DARK, 16).await;
+        controller.process(ALS_DARK, 62).await;
 
         // User doesn't change brightness anymore, so even if ALS or luma change, we are in cooldown period
-        controller.process(ALS_BRIGHT, 10).await;
+        controller.process(ALS_BRIGHT, 60).await;
         assert!(controller.pending_cooldown.is_active());
-        assert_eq!(Some(Entry::new(ALS_DIM, 66, 35)), controller.pending);
+        assert_eq!(Some(Entry::new(ALS_BRIGHT, 62, 35)), controller.pending);
 
         // One final process will trigger the learning
         controller.pending_cooldown.finish();
-        controller.process(ALS_DARK, 17).await;
+        controller.process(ALS_DARK, 61).await;
 
         assert_eq!(None, controller.pending);
         assert!(!controller.pending_cooldown.is_active());
-        assert_eq!(vec![Entry::new(ALS_DIM, 66, 35)], controller.data.entries);
+        assert_eq!(vec![Entry::new(ALS_DARK, 62, 35)], controller.data.entries);
 
+        Ok(())
+    }
+
+    #[apply(test!)]
+    async fn unstable_als_prevents_prediction() -> Result<()> {
+        let (mut controller, _, prediction_rx) = setup().await?;
+        controller.data.entries = vec![Entry::new(ALS_DIM, 20, 30)];
+
+        controller
+            .process_reading(
+                Reading {
+                    value: ALS_DIM,
+                    stable: false,
+                },
+                20,
+            )
+            .await;
+
+        assert!(prediction_rx.is_empty());
+        Ok(())
+    }
+
+    #[apply(test!)]
+    async fn unstable_als_delays_learning_after_cooldown() -> Result<()> {
+        let (mut controller, user_tx, _) = setup().await?;
+        user_tx.send(33).await?;
+        controller.process(ALS_DIM, 20).await;
+        controller
+            .process_reading(
+                Reading {
+                    value: ALS_DIM,
+                    stable: false,
+                },
+                20,
+            )
+            .await;
+        controller.pending_cooldown.finish();
+        controller
+            .process_reading(
+                Reading {
+                    value: ALS_DIM,
+                    stable: false,
+                },
+                20,
+            )
+            .await;
+        assert!(controller.pending.is_some());
+        assert!(controller.data.entries.is_empty());
+
+        controller
+            .process_reading(
+                Reading {
+                    value: ALS_BRIGHT,
+                    stable: true,
+                },
+                20,
+            )
+            .await;
+
+        assert_eq!(None, controller.pending);
+        assert_eq!(
+            vec![Entry::new(ALS_BRIGHT, 20, 33)],
+            controller.data.entries
+        );
         Ok(())
     }
 

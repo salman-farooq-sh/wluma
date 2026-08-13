@@ -12,7 +12,6 @@ use v4l::io::traits::CaptureStream;
 use v4l::video::Capture;
 use v4l::{Device, FourCC};
 
-const DEFAULT_LIGHTNESS: u64 = 100;
 const CAPTURE_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct Webcam {
@@ -78,30 +77,33 @@ impl Webcam {
 
 pub struct Als {
     webcam_rx: Receiver<u64>,
-    lightness: Mutex<u64>,
+    lightness: Mutex<Option<u64>>,
 }
 
 impl Als {
     pub fn new(webcam_rx: Receiver<u64>) -> Self {
         Self {
             webcam_rx,
-            lightness: Mutex::new(DEFAULT_LIGHTNESS),
+            lightness: Mutex::new(None),
         }
     }
 
-    pub async fn get(&self) -> Result<u64> {
+    pub async fn get(&self) -> Result<Option<u64>> {
         let value = self.get_raw().await?;
-        log::trace!("ALS (webcam): {value}");
+        if let Some(value) = value {
+            log::trace!("ALS (webcam): {value}");
+        }
         Ok(value)
     }
 
-    async fn get_raw(&self) -> Result<u64> {
+    async fn get_raw(&self) -> Result<Option<u64>> {
+        let current = *self.lightness.lock_blocking();
         let new_value = self
             .webcam_rx
             .recv_maybe_last()
             .await
             .expect("webcam_rx closed unexpectedly")
-            .unwrap_or(*self.lightness.lock_blocking());
+            .or(current);
         *self.lightness.lock_blocking() = new_value;
         Ok(new_value)
     }
@@ -122,10 +124,10 @@ mod tests {
     }
 
     #[apply(test!)]
-    async fn test_get_raw_returns_default_value_when_no_data_from_webcam() -> Result<()> {
+    async fn test_get_raw_returns_none_when_no_data_from_webcam() -> Result<()> {
         let (als, _) = setup().await;
 
-        assert_eq!(DEFAULT_LIGHTNESS, als.get_raw().await?);
+        assert_eq!(None, als.get_raw().await?);
         Ok(())
     }
 
@@ -135,7 +137,7 @@ mod tests {
 
         webcam_tx.send(42).await?;
 
-        assert_eq!(42, als.get_raw().await?);
+        assert_eq!(Some(42), als.get_raw().await?);
         Ok(())
     }
 
@@ -147,7 +149,7 @@ mod tests {
         webcam_tx.send(43).await?;
         webcam_tx.send(44).await?;
 
-        assert_eq!(44, als.get_raw().await?);
+        assert_eq!(Some(44), als.get_raw().await?);
         Ok(())
     }
 
@@ -158,9 +160,9 @@ mod tests {
         webcam_tx.send(42).await?;
         webcam_tx.send(43).await?;
 
-        assert_eq!(43, als.get_raw().await?);
-        assert_eq!(43, als.get_raw().await?);
-        assert_eq!(43, als.get_raw().await?);
+        assert_eq!(Some(43), als.get_raw().await?);
+        assert_eq!(Some(43), als.get_raw().await?);
+        assert_eq!(Some(43), als.get_raw().await?);
         Ok(())
     }
 }

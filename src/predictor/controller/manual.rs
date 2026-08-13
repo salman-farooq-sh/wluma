@@ -1,16 +1,20 @@
 use super::{Cooldown, INITIAL_TIMEOUT, PENDING_COOLDOWN};
-use crate::{als::Scale, channel_ext::ReceiverExt, predictor::data::Entry};
+use crate::{
+    als::{Reading, Scale},
+    channel_ext::ReceiverExt,
+    predictor::data::Entry,
+};
 use smol::channel::{Receiver, Sender};
 
 pub struct Controller {
     prediction_tx: Sender<u64>,
     user_rx: Receiver<u64>,
-    als_rx: Receiver<u64>,
+    als_rx: Receiver<Reading>,
     last_brightness: Option<u64>,
     points: Vec<Entry>,
     pre_reduction_brightness: Option<u64>,
     pending_cooldown: Cooldown,
-    last_als: Option<u64>,
+    last_als: Option<Reading>,
     output_name: String,
     scale: Scale,
 }
@@ -19,7 +23,7 @@ impl Controller {
     pub fn new(
         prediction_tx: Sender<u64>,
         user_rx: Receiver<u64>,
-        als_rx: Receiver<u64>,
+        als_rx: Receiver<Reading>,
         points: Vec<Entry>,
         output_name: &str,
         scale: Scale,
@@ -58,11 +62,24 @@ impl Controller {
             self.last_als = Some(als);
         }
 
-        let als = self.last_als.expect("ALS value must be known");
-        self.process(als, luma).await;
+        let reading = self.last_als.expect("ALS value must be known");
+        self.process_reading(reading, luma).await;
     }
 
+    #[cfg(test)]
     async fn process(&mut self, als: u64, luma: u8) {
+        self.process_reading(
+            Reading {
+                value: als,
+                stable: true,
+            },
+            luma,
+        )
+        .await;
+    }
+
+    async fn process_reading(&mut self, reading: Reading, luma: u8) {
+        let als = reading.value;
         if self.last_brightness.is_none() {
             // Brightness controller is expected to send the initial value on this channel asap
             self.last_brightness = self
@@ -86,7 +103,7 @@ impl Controller {
         if self.last_brightness != Some(current_brightness) {
             self.process_brightness_change(current_brightness, als, luma);
             self.pending_cooldown.reset(PENDING_COOLDOWN);
-        } else if !self.pending_cooldown.is_active() {
+        } else if reading.stable && !self.pending_cooldown.is_active() {
             self.pending_cooldown.clear();
             self.predict(current_brightness, als, luma).await;
         }
@@ -137,7 +154,12 @@ mod tests {
         let (als_tx, als_rx) = channel::bounded(128);
         let (user_tx, user_rx) = channel::bounded(128);
         let (prediction_tx, prediction_rx) = channel::bounded(128);
-        als_tx.send(ALS_DIM).await?;
+        als_tx
+            .send(Reading {
+                value: ALS_DIM,
+                stable: true,
+            })
+            .await?;
         user_tx.send(0).await?;
 
         let points = vec![
@@ -212,6 +234,24 @@ mod tests {
         controller.process(ALS_DIM, 80).await;
         assert_eq!(prediction_rx.recv().await?, 82);
 
+        Ok(())
+    }
+
+    #[apply(test!)]
+    async fn test_unstable_als_prevents_prediction() -> Result<()> {
+        let (mut controller, user_tx, prediction_rx) = setup().await?;
+        user_tx.send(100).await?;
+        controller
+            .process_reading(
+                Reading {
+                    value: ALS_DIM,
+                    stable: false,
+                },
+                50,
+            )
+            .await;
+
+        assert!(prediction_rx.is_empty());
         Ok(())
     }
 

@@ -35,6 +35,12 @@ impl Scale {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reading {
+    pub value: u64,
+    pub stable: bool,
+}
+
 #[allow(clippy::large_enum_variant)]
 pub enum Als {
     Webcam(webcam::Als),
@@ -44,12 +50,12 @@ pub enum Als {
 }
 
 impl Als {
-    pub async fn get(&self) -> Result<u64> {
+    pub async fn get(&self) -> Result<Option<u64>> {
         match self {
             Self::Webcam(als) => als.get().await,
-            Self::Iio(als) => als.get().await,
-            Self::Time(als) => als.get().await,
-            Self::None(als) => als.get().await,
+            Self::Iio(als) => als.get().await.map(Some),
+            Self::Time(als) => als.get().await.map(Some),
+            Self::None(als) => als.get().await.map(Some),
         }
     }
 
@@ -57,6 +63,13 @@ impl Als {
         match self {
             Self::Iio(als) => als.poll_interval(),
             Self::Webcam(_) | Self::Time(_) | Self::None(_) => DEFAULT_POLL_INTERVAL,
+        }
+    }
+
+    pub fn scale(&self) -> Scale {
+        match self {
+            Self::Iio(_) => Scale::Lux,
+            Self::Webcam(_) | Self::Time(_) | Self::None(_) => Scale::Linear,
         }
     }
 }
