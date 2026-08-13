@@ -318,6 +318,9 @@ mod tests {
     #[test]
     fn test_empty_config_uses_auto_als() {
         let config = parse_config_str("").unwrap();
+        let debug = format!("{config:#?}");
+        assert!(!debug.contains("thresholds"));
+        assert!(!debug.contains("\"night\""));
         assert!(matches!(config.als, app::Als::Auto { .. }));
     }
 
