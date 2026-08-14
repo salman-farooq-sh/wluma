@@ -54,9 +54,9 @@ async fn main() {
                 let (user_tx, user_rx) = channel::bounded(128);
                 let (prediction_tx, prediction_rx) = channel::bounded(128);
 
-                let (output_name, output_capturer) = match output_clone.clone() {
-                    config::Output::Backlight(cfg) => (cfg.name, cfg.capturer),
-                    config::Output::DdcUtil(cfg) => (cfg.name, cfg.capturer),
+                let (output_name, output_capturer, vulkan_device) = match output_clone.clone() {
+                    config::Output::Backlight(cfg) => (cfg.name, cfg.capturer, cfg.vulkan_device),
+                    config::Output::DdcUtil(cfg) => (cfg.name, cfg.capturer, cfg.vulkan_device),
                 };
 
                 let brightness = match output {
@@ -125,7 +125,9 @@ async fn main() {
                                 ),
                             };
 
-                            frame_capturer.run(&output_name, controller).await;
+                            frame_capturer
+                                .run(&output_name, controller, vulkan_device.as_deref())
+                                .await;
                         }));
 
                         als_txs.push(als_tx);

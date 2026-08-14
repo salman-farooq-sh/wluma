@@ -92,6 +92,7 @@ fn parse_config_str(file_config: &str) -> Result<app::Config, toml::de::Error> {
                     path: o.path.unwrap_or_default(),
                     min_brightness: 1,
                     capturer: match_capturer(o.capturer.unwrap_or_default()),
+                    vulkan_device: o.vulkan_device.into(),
                     predictor: match_predictor(o.predictor.unwrap_or_default()),
                 })
             })
@@ -104,6 +105,7 @@ fn parse_config_str(file_config: &str) -> Result<app::Config, toml::de::Error> {
                     identifier_overridden,
                     min_brightness: 1,
                     capturer: match_capturer(o.capturer.unwrap_or_default()),
+                    vulkan_device: o.vulkan_device.into(),
                     predictor: match_predictor(o.predictor.unwrap_or_default()),
                 })
             }))
@@ -113,6 +115,7 @@ fn parse_config_str(file_config: &str) -> Result<app::Config, toml::de::Error> {
                     path: k.path,
                     min_brightness: 0,
                     capturer: Capturer::None,
+                    vulkan_device: app::VulkanDevice::Auto,
                     predictor: app::Predictor::Adaptive,
                 })
             }))
@@ -200,6 +203,7 @@ thresholds = { 0 = "night" }
 [[output.backlight]]
 name = "eDP-1"
 capturer = "none"
+vulkan_device = "/dev/dri/renderD128"
 "#,
         )
         .unwrap();
@@ -209,6 +213,7 @@ capturer = "none"
                 assert_eq!(output.name, "eDP-1");
                 assert!(output.path.is_empty());
                 assert!(matches!(output.capturer, app::Capturer::None));
+                assert_eq!(output.vulkan_device.as_deref(), Some("/dev/dri/renderD128"));
             }
             _ => unreachable!(),
         }

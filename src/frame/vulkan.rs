@@ -1,6 +1,6 @@
 use crate::frame::compute_perceived_lightness_percent;
 use crate::frame::object::Object;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use ash::ext::image_drm_format_modifier::Device as DrmModifierDevice;
 use ash::khr::external_memory_fd::Device as KHRDevice;
 use ash::{vk, Device, Entry, Instance};
@@ -12,6 +12,7 @@ use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::ops::Drop;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
 const VULKAN_VERSION: u32 = vk::make_api_version(0, 1, 2, 0);
 
@@ -41,8 +42,62 @@ pub struct Vulkan {
     exportable_frame_image_fd: Option<OwnedFd>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DrmDevice {
+    major: u32,
+    minor: u32,
+}
+
+impl DrmDevice {
+    fn label(self) -> String {
+        let sysfs_path = format!("/sys/dev/char/{}:{}", self.major, self.minor);
+        std::fs::canonicalize(sysfs_path)
+            .ok()
+            .and_then(|path| path.file_name()?.to_str().map(str::to_string))
+            .map(|name| format!("/dev/dri/{name} ({}:{})", self.major, self.minor))
+            .unwrap_or_else(|| format!("{}:{}", self.major, self.minor))
+    }
+}
+
+struct Candidate {
+    physical_device: vk::PhysicalDevice,
+    queue_family_index: u32,
+    properties: vk::PhysicalDeviceProperties,
+    supports_drm_modifier: bool,
+    primary_drm_device: Option<DrmDevice>,
+    render_drm_device: Option<DrmDevice>,
+}
+
+impl Candidate {
+    fn matches_drm_device(&self, device: DrmDevice) -> bool {
+        self.primary_drm_device == Some(device) || self.render_drm_device == Some(device)
+    }
+}
+
 impl Vulkan {
-    pub fn new() -> Result<Self> {
+    pub fn new(device_path: Option<&str>) -> Result<Self> {
+        let drm_device = device_path
+            .map(|path| {
+                let metadata = std::fs::metadata(path)
+                    .with_context(|| format!("Unable to inspect Vulkan device {path}"))?;
+                if !metadata.file_type().is_char_device() {
+                    return Err(anyhow!("Vulkan device {path} is not a character device"));
+                }
+                let device = metadata.rdev();
+                Ok(DrmDevice {
+                    major: libc::major(device),
+                    minor: libc::minor(device),
+                })
+            })
+            .transpose()?;
+        Self::new_for_device(drm_device, device_path)
+    }
+
+    pub fn new_for_drm_device(major: u32, minor: u32) -> Result<Self> {
+        Self::new_for_device(Some(DrmDevice { major, minor }), None)
+    }
+
+    fn new_for_device(drm_device: Option<DrmDevice>, device_path: Option<&str>) -> Result<Self> {
         let app_name = CString::new("wluma")?;
         let app_version: u32 = vk::make_api_version(
             0,
@@ -80,34 +135,158 @@ impl Vulkan {
                 .enumerate_physical_devices()
                 .map_err(anyhow::Error::msg)?
         };
-        for (index, physical_device) in physical_devices.iter().enumerate() {
-            let properties = unsafe { instance.get_physical_device_properties(*physical_device) };
+        let mut candidates = Vec::new();
+        for (index, physical_device) in physical_devices.into_iter().enumerate() {
+            let properties = unsafe { instance.get_physical_device_properties(physical_device) };
             let name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }.to_string_lossy();
+            let extensions = unsafe {
+                instance
+                    .enumerate_device_extension_properties(physical_device)
+                    .map_err(anyhow::Error::msg)?
+            };
+            let supports = |name: &CStr| unsafe {
+                extensions
+                    .iter()
+                    .any(|extension| CStr::from_ptr(extension.extension_name.as_ptr()) == name)
+            };
+            let supports_external_memory_fd = supports(vk::KHR_EXTERNAL_MEMORY_FD_NAME);
+            let supports_dma_buf = supports(vk::EXT_EXTERNAL_MEMORY_DMA_BUF_NAME);
+            let supports_drm_modifier = supports(vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME);
+            let drm_properties = if supports(vk::EXT_PHYSICAL_DEVICE_DRM_NAME) {
+                let mut drm_properties = vk::PhysicalDeviceDrmPropertiesEXT::default();
+                let mut properties2 =
+                    vk::PhysicalDeviceProperties2::default().push_next(&mut drm_properties);
+                unsafe {
+                    instance.get_physical_device_properties2(physical_device, &mut properties2);
+                }
+                Some(drm_properties)
+            } else {
+                None
+            };
+            let primary_drm_device = drm_properties.as_ref().and_then(|properties| {
+                (properties.has_primary == vk::TRUE).then_some(DrmDevice {
+                    major: properties.primary_major as u32,
+                    minor: properties.primary_minor as u32,
+                })
+            });
+            let render_drm_device = drm_properties.as_ref().and_then(|properties| {
+                (properties.has_render == vk::TRUE).then_some(DrmDevice {
+                    major: properties.render_major as u32,
+                    minor: properties.render_minor as u32,
+                })
+            });
+            let primary_drm_name = primary_drm_device
+                .map(DrmDevice::label)
+                .unwrap_or_else(|| "unknown".to_string());
+            let render_drm_name = render_drm_device
+                .map(DrmDevice::label)
+                .unwrap_or_else(|| "unknown".to_string());
             log::debug!(
-                "Discovered Vulkan device {index}: '{name}', type={}, API {}.{}.{}, driver version {}",
+                "Discovered Vulkan device {index}: '{name}', type={}, API {}.{}.{}, driver version {}, DRM primary device={primary_drm_name}, DRM render device={render_drm_name}, external-memory-fd={supports_external_memory_fd}, DMA-BUF={supports_dma_buf}, DRM modifiers={supports_drm_modifier}",
                 properties.device_type.as_raw(),
                 vk::api_version_major(properties.api_version),
                 vk::api_version_minor(properties.api_version),
                 vk::api_version_patch(properties.api_version),
                 properties.driver_version,
             );
+
+            if !supports_external_memory_fd || !supports_dma_buf {
+                log::debug!(
+                    "Ignoring Vulkan device '{name}': required DMA-BUF extensions are unavailable"
+                );
+                continue;
+            }
+            let Some(queue_family_index) =
+                unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
+                    .iter()
+                    .position(|properties| {
+                        properties.queue_flags.contains(vk::QueueFlags::TRANSFER)
+                    })
+            else {
+                log::debug!("Ignoring Vulkan device '{name}': no transfer-capable queue family");
+                continue;
+            };
+            let format_features = unsafe {
+                instance.get_physical_device_format_properties(
+                    physical_device,
+                    vk::Format::R8G8B8A8_UNORM,
+                )
+            }
+            .optimal_tiling_features;
+            let required_format_features = vk::FormatFeatureFlags::BLIT_SRC
+                | vk::FormatFeatureFlags::BLIT_DST
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+            if !format_features.contains(required_format_features) {
+                log::debug!("Ignoring Vulkan device '{name}': internal image format does not support the required blit operations");
+                continue;
+            }
+            candidates.push(Candidate {
+                physical_device,
+                queue_family_index: queue_family_index as u32,
+                properties,
+                supports_drm_modifier,
+                primary_drm_device,
+                render_drm_device,
+            });
         }
-        let physical_device = *physical_devices
-            .first()
-            .ok_or(anyhow!("Unable to find a physical device"))?;
-        let physical_device_properties =
-            unsafe { instance.get_physical_device_properties(physical_device) };
+
+        if let Some(wanted) = drm_device {
+            let matching: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| candidate.matches_drm_device(wanted))
+                .map(|candidate| candidate.physical_device)
+                .collect();
+            if matching.is_empty() {
+                if device_path.is_some() {
+                    candidates.clear();
+                } else {
+                    log::warn!(
+                        "Unable to match the compositor's DRM device {}:{} to a Vulkan device; using the best compatible device",
+                        wanted.major,
+                        wanted.minor
+                    );
+                }
+            } else {
+                candidates.retain(|candidate| matching.contains(&candidate.physical_device));
+            }
+        }
+
+        let candidate = candidates
+            .into_iter()
+            .max_by_key(|candidate| {
+                let device_type = match candidate.properties.device_type {
+                    vk::PhysicalDeviceType::INTEGRATED_GPU => 4,
+                    vk::PhysicalDeviceType::DISCRETE_GPU => 3,
+                    vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
+                    vk::PhysicalDeviceType::OTHER => 1,
+                    _ => 0,
+                };
+                (candidate.supports_drm_modifier as u8, device_type)
+            })
+            .ok_or_else(|| match (device_path, drm_device) {
+                (Some(path), _) => anyhow!("No compatible Vulkan device matches {path}"),
+                (None, Some(device)) => anyhow!(
+                    "No compatible Vulkan device matches DRM device {}:{}",
+                    device.major,
+                    device.minor
+                ),
+                _ => anyhow!("Unable to find a compatible Vulkan physical device"),
+            })?;
+        let physical_device = candidate.physical_device;
+        let physical_device_properties = candidate.properties;
+        let queue_family_index = candidate.queue_family_index;
+        let supports_drm_modifier = candidate.supports_drm_modifier;
         let physical_device_name =
             unsafe { CStr::from_ptr(physical_device_properties.device_name.as_ptr()) }
                 .to_string_lossy();
-
-        let queue_family_index =
-            unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
-                .iter()
-                .position(|properties| properties.queue_flags.contains(vk::QueueFlags::TRANSFER))
-                .ok_or(anyhow!(
-                    "Vulkan device has no transfer-capable queue family"
-                ))? as u32;
+        let primary_drm_name = candidate
+            .primary_drm_device
+            .map(DrmDevice::label)
+            .unwrap_or_else(|| "unknown".to_string());
+        let render_drm_name = candidate
+            .render_drm_device
+            .map(DrmDevice::label)
+            .unwrap_or_else(|| "unknown".to_string());
         let queue_info = &[vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
             .queue_priorities(&[1.0])];
@@ -116,21 +295,11 @@ impl Vulkan {
             vk::KHR_EXTERNAL_MEMORY_FD_NAME.as_ptr(),
             vk::EXT_EXTERNAL_MEMORY_DMA_BUF_NAME.as_ptr(),
         ];
-        let supports_drm_modifier = unsafe {
-            instance
-                .enumerate_device_extension_properties(physical_device)
-                .map_err(anyhow::Error::msg)?
-                .iter()
-                .any(|extension| {
-                    CStr::from_ptr(extension.extension_name.as_ptr())
-                        == vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME
-                })
-        };
         if supports_drm_modifier {
             device_extensions.push(vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME.as_ptr());
         }
         log::debug!(
-            "Using Vulkan device '{physical_device_name}', API {}.{}.{}, driver version {}, transfer queue family {}, DRM modifier extension={supports_drm_modifier}",
+            "Using Vulkan device '{physical_device_name}', DRM primary device={primary_drm_name}, DRM render device={render_drm_name}, API {}.{}.{}, driver version {}, transfer queue family {}, DRM modifier extension={supports_drm_modifier}",
             vk::api_version_major(physical_device_properties.api_version),
             vk::api_version_minor(physical_device_properties.api_version),
             vk::api_version_patch(physical_device_properties.api_version),
@@ -451,9 +620,20 @@ impl Vulkan {
         };
         let image_memory_req = unsafe { self.device.get_image_memory_requirements(image) };
 
+        let device_memory_properties = unsafe {
+            self.instance
+                .get_physical_device_memory_properties(self.physical_device)
+        };
+        let image_memory_type_index = find_memory_type_index(
+            &image_memory_req,
+            &device_memory_properties,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .or_else(|| memory_type_index(image_memory_req.memory_type_bits, "internal image").ok())
+        .ok_or(anyhow!("No Vulkan memory type supports the internal image"))?;
         let image_allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(image_memory_req.size)
-            .memory_type_index(0);
+            .memory_type_index(image_memory_type_index);
 
         let image_memory = unsafe {
             self.device
@@ -816,8 +996,21 @@ impl Vulkan {
             frame_image_mem_dedicated_req.requires_dedicated_allocation == vk::TRUE;
         let dedicated_preferred =
             frame_image_mem_dedicated_req.prefers_dedicated_allocation == vk::TRUE;
-        let memory_type_index =
-            memory_type_index(memory_requirements.memory_type_bits, "exported frame image")?;
+        let device_memory_properties = unsafe {
+            self.instance
+                .get_physical_device_memory_properties(self.physical_device)
+        };
+        let memory_type_index = find_memory_type_index(
+            &memory_requirements,
+            &device_memory_properties,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .or_else(|| {
+            memory_type_index(memory_requirements.memory_type_bits, "exported frame image").ok()
+        })
+        .ok_or(anyhow!(
+            "No Vulkan memory type supports the exported frame image"
+        ))?;
 
         // Specify that the memory can be exported
         let mut frame_import_memory_info = vk::ExportMemoryAllocateInfo::default()

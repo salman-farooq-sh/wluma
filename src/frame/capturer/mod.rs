@@ -11,16 +11,25 @@ pub enum Capturer {
 }
 
 impl Capturer {
-    pub async fn run(self, output_name: &str, controller: crate::predictor::Controller) {
+    pub async fn run(
+        self,
+        output_name: &str,
+        controller: crate::predictor::Controller,
+        vulkan_device: Option<&str>,
+    ) {
         match self {
             Capturer::Auto => {
                 let output = output_name.to_string();
+                let vulkan_device = vulkan_device.map(str::to_string);
                 smol::unblock(move || {
                     match wayland::Capturer::is_supported() {
                         Ok(true) => {
                             log::debug!("Auto capturer selected Wayland for '{output}'");
-                            wayland::Capturer::new(crate::config::WaylandProtocol::Any)
-                                .run(&output, controller);
+                            wayland::Capturer::new(crate::config::WaylandProtocol::Any).run(
+                                &output,
+                                controller,
+                                vulkan_device.as_deref(),
+                            );
                             return;
                         }
                         Ok(false) => {
@@ -34,7 +43,11 @@ impl Capturer {
                     match pipewire::prepare(&output, crate::config::PipewireProtocol::Any) {
                         Ok(source) => {
                             log::debug!("Auto capturer selected PipeWire for '{output}'");
-                            pipewire::run_prepared(source, controller);
+                            pipewire::run_prepared(
+                                source,
+                                controller,
+                                vulkan_device.as_deref(),
+                            );
                         }
                         Err(error) => {
                             log::warn!(
@@ -49,11 +62,16 @@ impl Capturer {
             Capturer::None(mut c) => c.run(output_name, controller).await,
             Capturer::Pipewire(protocol) => {
                 let output = output_name.to_string();
-                smol::unblock(move || pipewire::run(&output, protocol, controller)).await;
+                let vulkan_device = vulkan_device.map(str::to_string);
+                smol::unblock(move || {
+                    pipewire::run(&output, protocol, controller, vulkan_device.as_deref())
+                })
+                .await;
             }
             Capturer::Wayland(mut c) => {
                 let output = output_name.to_string();
-                smol::unblock(move || c.run(&output, controller)).await;
+                let vulkan_device = vulkan_device.map(str::to_string);
+                smol::unblock(move || c.run(&output, controller, vulkan_device.as_deref())).await;
             }
         }
     }

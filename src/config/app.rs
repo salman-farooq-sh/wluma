@@ -60,11 +60,43 @@ pub enum Predictor {
     },
 }
 
+#[derive(Clone, Default)]
+pub enum VulkanDevice {
+    #[default]
+    Auto,
+    Path(String),
+}
+
+impl VulkanDevice {
+    pub fn as_deref(&self) -> Option<&str> {
+        match self {
+            Self::Auto => None,
+            Self::Path(path) => Some(path),
+        }
+    }
+}
+
+impl From<Option<String>> for VulkanDevice {
+    fn from(path: Option<String>) -> Self {
+        path.map_or(Self::Auto, Self::Path)
+    }
+}
+
+impl fmt::Debug for VulkanDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => f.write_str("Auto"),
+            Self::Path(path) => path.fmt(f),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BacklightOutput {
     pub name: String,
     pub path: String,
     pub capturer: Capturer,
+    pub vulkan_device: VulkanDevice,
     pub min_brightness: u64,
     pub predictor: Predictor,
 }
@@ -75,6 +107,7 @@ pub struct DdcUtilOutput {
     pub identifier: String,
     pub identifier_overridden: bool,
     pub capturer: Capturer,
+    pub vulkan_device: VulkanDevice,
     pub min_brightness: u64,
     pub predictor: Predictor,
 }
@@ -89,4 +122,21 @@ pub enum Output {
 pub struct Config {
     pub als: Als,
     pub output: Vec<Output>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VulkanDevice;
+
+    #[test]
+    fn formats_automatic_vulkan_device_for_config_dump() {
+        assert_eq!(format!("{:?}", VulkanDevice::Auto), "Auto");
+        assert_eq!(
+            format!(
+                "{:?}",
+                VulkanDevice::Path("/dev/dri/renderD128".to_string())
+            ),
+            "\"/dev/dri/renderD128\""
+        );
+    }
 }

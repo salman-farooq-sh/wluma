@@ -2126,6 +2126,7 @@ dependencies = [
  "inotify",
  "itertools 0.15.0",
  "lazy_static",
+ "libc",
  "log",
  "macro_rules_attribute",
  "pipewire",

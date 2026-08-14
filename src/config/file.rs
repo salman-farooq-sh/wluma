@@ -67,6 +67,7 @@ pub struct BacklightOutput {
     pub name: String,
     pub path: Option<String>,
     pub capturer: Option<Capturer>,
+    pub vulkan_device: Option<String>,
     pub predictor: Option<Predictor>,
 }
 
@@ -75,6 +76,7 @@ pub struct DdcUtilOutput {
     pub name: String,
     pub identifier: Option<String>,
     pub capturer: Option<Capturer>,
+    pub vulkan_device: Option<String>,
     pub predictor: Option<Predictor>,
 }
 

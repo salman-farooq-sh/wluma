@@ -53,6 +53,7 @@ pub fn outputs() -> Vec<app::Output> {
                 name: connector.name,
                 path: backlight.path.to_string_lossy().into_owned(),
                 capturer: app::Capturer::Auto,
+                vulkan_device: app::VulkanDevice::Auto,
                 min_brightness: 1,
                 predictor: app::Predictor::Adaptive,
             }));
@@ -80,6 +81,7 @@ pub fn outputs() -> Vec<app::Output> {
                         identifier,
                         identifier_overridden: false,
                         capturer: app::Capturer::Auto,
+                        vulkan_device: app::VulkanDevice::Auto,
                         min_brightness: 1,
                         predictor: app::Predictor::Adaptive,
                     }));
@@ -123,6 +125,7 @@ fn keyboards() -> Vec<app::Output> {
                 name,
                 path: path.to_string_lossy().into_owned(),
                 capturer: app::Capturer::None,
+                vulkan_device: app::VulkanDevice::Auto,
                 min_brightness: 0,
                 predictor: app::Predictor::Adaptive,
             }))
@@ -264,6 +267,7 @@ fn apply_overrides(detected: &mut app::Output, configured: app::Output) {
                 detected.path = configured.path;
             }
             detected.capturer = configured.capturer;
+            detected.vulkan_device = configured.vulkan_device;
             detected.predictor = configured.predictor;
         }
         (app::Output::DdcUtil(detected), app::Output::DdcUtil(configured)) => {
@@ -273,14 +277,17 @@ fn apply_overrides(detected: &mut app::Output, configured: app::Output) {
                 detected.identifier_overridden = true;
             }
             detected.capturer = configured.capturer;
+            detected.vulkan_device = configured.vulkan_device;
             detected.predictor = configured.predictor;
         }
         (app::Output::Backlight(detected), app::Output::DdcUtil(configured)) => {
             detected.capturer = configured.capturer;
+            detected.vulkan_device = configured.vulkan_device;
             detected.predictor = configured.predictor;
         }
         (app::Output::DdcUtil(detected), app::Output::Backlight(configured)) => {
             detected.capturer = configured.capturer;
+            detected.vulkan_device = configured.vulkan_device;
             detected.predictor = configured.predictor;
         }
     }
@@ -309,6 +316,7 @@ mod tests {
             name: name.to_string(),
             path: path.to_string(),
             capturer,
+            vulkan_device: app::VulkanDevice::Auto,
             min_brightness: 1,
             predictor: app::Predictor::Adaptive,
         })
@@ -362,6 +370,7 @@ mod tests {
             identifier: "HDMI-A-1".to_string(),
             identifier_overridden: false,
             capturer: app::Capturer::None,
+            vulkan_device: app::VulkanDevice::Auto,
             min_brightness: 1,
             predictor: app::Predictor::Adaptive,
         });
@@ -370,6 +379,7 @@ mod tests {
             identifier: "serial-123".to_string(),
             identifier_overridden: false,
             capturer: app::Capturer::Auto,
+            vulkan_device: app::VulkanDevice::Auto,
             min_brightness: 1,
             predictor: app::Predictor::Adaptive,
         });

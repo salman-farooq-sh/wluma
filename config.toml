@@ -13,6 +13,7 @@ thresholds = { 0 = "night", 20 = "dark", 80 = "dim", 250 = "normal", 500 = "brig
 # [[output.backlight]]
 # name = "eDP-1"
 # capturer = "none"
+# vulkan_device = "/dev/dri/renderD128"
 # path = "/sys/class/backlight/intel_backlight"
 
 # [[output.ddcutil]]

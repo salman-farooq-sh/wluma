@@ -20,10 +20,15 @@ pub(super) type Source = (u32, Option<Portal>);
 const FRAME_RATE: u32 = 10;
 const FRAME_INTERVAL: Duration = Duration::from_millis(1000 / FRAME_RATE as u64);
 
-pub fn run(output_name: &str, protocol: PipewireProtocol, controller: Controller) {
+pub fn run(
+    output_name: &str,
+    protocol: PipewireProtocol,
+    controller: Controller,
+    vulkan_device: Option<&str>,
+) {
     let source = prepare(output_name, protocol)
         .unwrap_or_else(|error| panic!("Unable to create PipeWire screen stream: {error:#}"));
-    run_prepared(source, controller);
+    run_prepared(source, controller, vulkan_device);
 }
 
 pub(super) fn prepare(output_name: &str, protocol: PipewireProtocol) -> Result<Source> {
@@ -40,8 +45,8 @@ pub(super) fn prepare(output_name: &str, protocol: PipewireProtocol) -> Result<S
     }
 }
 
-pub(super) fn run_prepared(source: Source, controller: Controller) {
-    capture(source.0, source.1, controller)
+pub(super) fn run_prepared(source: Source, controller: Controller, vulkan_device: Option<&str>) {
+    capture(source.0, source.1, controller, vulkan_device)
         .unwrap_or_else(|error| panic!("Unable to capture PipeWire screen stream: {error:#}"));
 }
 
@@ -75,7 +80,12 @@ struct Data {
     last_frame_at: Option<Instant>,
 }
 
-fn capture(node: u32, portal: Option<Portal>, controller: Controller) -> Result<()> {
+fn capture(
+    node: u32,
+    portal: Option<Portal>,
+    controller: Controller,
+    vulkan_device: Option<&str>,
+) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
@@ -95,7 +105,7 @@ fn capture(node: u32, portal: Option<Portal>, controller: Controller) -> Result<
             *pw::keys::MEDIA_ROLE => "Screen",
         },
     )?;
-    let vulkan = Vulkan::new()?;
+    let vulkan = Vulkan::new(vulkan_device)?;
     let mut modifiers = vulkan.importable_modifiers(DrmFourcc::Xrgb8888 as u32)?;
     let rgbx_modifiers = vulkan.importable_modifiers(DrmFourcc::Xbgr8888 as u32)?;
     modifiers.retain(|modifier| rgbx_modifiers.contains(modifier));

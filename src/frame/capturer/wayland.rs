@@ -21,6 +21,7 @@ use wayland_protocols::ext::image_capture_source::v1::client::ext_output_image_c
 use wayland_protocols::ext::image_capture_source::v1::client::ext_image_capture_source_v1::ExtImageCaptureSourceV1;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::Flags;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1;
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 use wayland_protocols_wlr::export_dmabuf::v1::client::zwlr_export_dmabuf_frame_v1::ZwlrExportDmabufFrameV1;
 use wayland_protocols_wlr::export_dmabuf::v1::client::zwlr_export_dmabuf_manager_v1::ZwlrExportDmabufManagerV1;
@@ -34,6 +35,8 @@ pub struct Capturer {
     protocol: WaylandProtocol,
     is_processing_frame: bool,
     vulkan: Option<Vulkan>,
+    vulkan_device: Option<String>,
+    drm_device: Option<(u32, u32)>,
     output: Option<WlOutput>,
     output_global_id: Option<u32>,
     output_match: Option<OutputMatch>,
@@ -43,6 +46,7 @@ pub struct Capturer {
     controller: Option<Controller>,
     // linux-dmabuf-v1
     dmabuf: Option<ZwpLinuxDmabufV1>,
+    dmabuf_feedback: Option<ZwpLinuxDmabufFeedbackV1>,
     wl_buffer: Option<WlBuffer>,
     // ext-image-capture-source-v1
     img_capture_source_manager: Option<ExtOutputImageCaptureSourceManagerV1>,
@@ -81,6 +85,8 @@ impl Capturer {
             protocol,
             is_processing_frame: false,
             vulkan: None,
+            vulkan_device: None,
+            drm_device: None,
             output: None,
             output_global_id: None,
             output_match: None,
@@ -90,6 +96,7 @@ impl Capturer {
             controller: None,
             // linux-dmabuf-v1
             dmabuf: None,
+            dmabuf_feedback: None,
             wl_buffer: None,
             // ext-image-capture-source-v1
             img_capture_source_manager: None,
@@ -128,7 +135,8 @@ impl Capturer {
             || capturer.dmabuf_manager.is_some())
     }
 
-    pub fn run(&mut self, output_name: &str, controller: Controller) {
+    pub fn run(&mut self, output_name: &str, controller: Controller, vulkan_device: Option<&str>) {
+        self.vulkan_device = vulkan_device.map(str::to_string);
         let connection =
             Connection::connect_to_env().expect("Unable to connect to Wayland display");
         let display = connection.display();
@@ -206,7 +214,16 @@ impl Capturer {
         };
         log::debug!("Using {protocol_to_use} protocol to request frames");
 
-        self.vulkan = Some(Vulkan::new().expect("Unable to initialize Vulkan"));
+        self.vulkan = Some(
+            if let Some(path) = self.vulkan_device.as_deref() {
+                Vulkan::new(Some(path))
+            } else if let Some((major, minor)) = self.drm_device {
+                Vulkan::new_for_drm_device(major, minor)
+            } else {
+                Vulkan::new(None)
+            }
+            .expect("Unable to initialize Vulkan"),
+        );
         self.controller = Some(controller);
 
         loop {
@@ -398,8 +415,11 @@ impl Dispatch<WlRegistry, GlobalsContext> for Capturer {
                     }
                     _ if interface == ZwpLinuxDmabufV1::interface().name => {
                         log::debug!("Detected support for linux-dmabuf-v1 protocol");
-                        state.dmabuf =
-                            Some(registry.bind::<ZwpLinuxDmabufV1, _, _>(name, version, qh, ()));
+                        let dmabuf = registry.bind::<ZwpLinuxDmabufV1, _, _>(name, version, qh, ());
+                        if dmabuf.version() >= 4 {
+                            state.dmabuf_feedback = Some(dmabuf.get_default_feedback(qh, ()));
+                        }
+                        state.dmabuf = Some(dmabuf);
                     }
                     _ if interface == ZwlrScreencopyManagerV1::interface().name => {
                         log::debug!("Detected support for wlr-screencopy-unstable-v1 protocol");
@@ -541,6 +561,12 @@ impl Dispatch<ZwlrExportDmabufFrameV1, ()> for Capturer {
 
 // ==== linux-dmabuf-v1 protocol ====
 
+fn parse_drm_device(bytes: &[u8]) -> Option<(u32, u32)> {
+    let bytes: [u8; std::mem::size_of::<libc::dev_t>()] = bytes.try_into().ok()?;
+    let device = libc::dev_t::from_ne_bytes(bytes);
+    Some((libc::major(device), libc::minor(device)))
+}
+
 impl Dispatch<ZwpLinuxDmabufV1, ()> for Capturer {
     fn event(
         _: &mut Self,
@@ -567,6 +593,26 @@ impl Dispatch<ZwpLinuxDmabufV1, ()> for Capturer {
                 );
             }
             _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwpLinuxDmabufFeedbackV1, ()> for Capturer {
+    fn event(
+        state: &mut Self,
+        _: &ZwpLinuxDmabufFeedbackV1,
+        event: <ZwpLinuxDmabufFeedbackV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_feedback_v1::Event;
+
+        if let Event::MainDevice { device } = event {
+            let (major, minor) =
+                parse_drm_device(&device).expect("Compositor sent an invalid DMA-BUF main device");
+            log::debug!("linux-dmabuf-v1 main device={major}:{minor}");
+            state.drm_device = Some((major, minor));
         }
     }
 }
@@ -776,9 +822,17 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for Capturer {
             }
 
             Event::DmabufDevice { device } => {
-                log::debug!(
-                    "ext-image-copy-capture DMA-BUF allocation device dev_t bytes={device:02x?}"
-                );
+                let (major, minor) = parse_drm_device(&device)
+                    .expect("Compositor sent an invalid DMA-BUF allocation device");
+                log::debug!("ext-image-copy-capture DMA-BUF allocation device={major}:{minor}");
+                let device_changed = state.drm_device != Some((major, minor));
+                state.drm_device = Some((major, minor));
+                if state.vulkan_device.is_none() && device_changed {
+                    state.vulkan =
+                        Some(Vulkan::new_for_drm_device(major, minor).expect(
+                            "Unable to initialize Vulkan on the compositor's DMA-BUF device",
+                        ));
+                }
             }
 
             Event::DmabufFormat { format, modifiers } => {
@@ -920,7 +974,13 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for Capturer {
 
 #[cfg(test)]
 mod tests {
-    use super::{match_action, output_match, MatchAction, OutputMatch};
+    use super::{match_action, output_match, parse_drm_device, MatchAction, OutputMatch};
+
+    #[test]
+    fn parses_drm_device() {
+        let device = libc::makedev(226, 128);
+        assert_eq!(parse_drm_device(&device.to_ne_bytes()), Some((226, 128)));
+    }
 
     #[test]
     fn ranks_exact_names_above_substrings() {
