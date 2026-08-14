@@ -62,13 +62,13 @@ struct GlobalsContext {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum OutputMatch {
+pub(super) enum OutputMatch {
     Substring,
     Exact,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum MatchAction {
+pub(super) enum MatchAction {
     Select,
     Replace,
     Ambiguous,
@@ -285,7 +285,7 @@ impl Capturer {
 
 // ==== Globals ====
 
-fn output_match(value: &str, desired_output: &str, exact: bool) -> Option<OutputMatch> {
+pub(super) fn output_match(value: &str, desired_output: &str, exact: bool) -> Option<OutputMatch> {
     if desired_output.is_empty() || !value.contains(desired_output) {
         None
     } else if exact && value == desired_output {
@@ -295,7 +295,7 @@ fn output_match(value: &str, desired_output: &str, exact: bool) -> Option<Output
     }
 }
 
-fn match_action(
+pub(super) fn match_action(
     current: Option<OutputMatch>,
     candidate: OutputMatch,
     same_output: bool,

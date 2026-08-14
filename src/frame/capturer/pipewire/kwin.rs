@@ -1,3 +1,4 @@
+use super::super::wayland::{match_action, output_match, MatchAction, OutputMatch};
 use anyhow::{anyhow, Context, Result};
 use std::sync::{Arc, Mutex};
 use wayland_client::protocol::wl_output::WlOutput;
@@ -19,6 +20,8 @@ struct State {
     manager: Option<ZkdeScreencastUnstableV1>,
     output: Option<WlOutput>,
     output_name: Option<String>,
+    output_match: Option<OutputMatch>,
+    output_match_ambiguous: bool,
     node: Option<u32>,
     failure: Option<String>,
 }
@@ -53,6 +56,9 @@ fn find(output_name: &str, create_stream: bool) -> Result<(Option<u32>, Option<S
         .output
         .as_ref()
         .ok_or_else(|| anyhow!("Unable to match '{output_name}' to a Wayland output"))?;
+    if state.output_match_ambiguous {
+        return Err(anyhow!("Multiple Wayland outputs match '{output_name}'"));
+    }
     if !create_stream {
         return Ok((None, state.output_name));
     }
@@ -124,30 +130,35 @@ impl Dispatch<WlOutput, OutputContext> for State {
     ) {
         use wayland_client::protocol::wl_output::Event;
 
-        let matches = match event {
+        let candidate = match event {
             Event::Name { name } => {
                 *context.name.lock().unwrap() = Some(name.clone());
                 if state.output.as_ref() == Some(output) {
                     state.output_name = Some(name.clone());
                 }
-                name.contains(&context.desired_output)
+                output_match(&name, &context.desired_output, true)
             }
-            Event::Description { description } => description.contains(&context.desired_output),
-            _ => false,
+            Event::Description { description } => {
+                output_match(&description, &context.desired_output, false)
+            }
+            _ => None,
         };
-        if matches {
-            match state.output.as_ref() {
-                None => {
+        if let Some(candidate) = candidate {
+            let same_output = state.output.as_ref() == Some(output);
+            match match_action(state.output_match, candidate, same_output) {
+                MatchAction::Select => {
                     state.output = Some(output.clone());
                     state.output_name = context.name.lock().unwrap().clone();
+                    state.output_match = Some(candidate);
                 }
-                Some(selected) if selected != output => {
-                    log::error!(
-                        "Multiple Wayland outputs match '{}'",
-                        context.desired_output
-                    );
+                MatchAction::Replace => {
+                    state.output = Some(output.clone());
+                    state.output_name = context.name.lock().unwrap().clone();
+                    state.output_match = Some(candidate);
+                    state.output_match_ambiguous = false;
                 }
-                _ => {}
+                MatchAction::Ambiguous => state.output_match_ambiguous = true,
+                MatchAction::Ignore => {}
             }
         }
     }
