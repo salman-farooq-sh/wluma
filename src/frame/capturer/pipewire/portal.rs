@@ -7,7 +7,7 @@ use dbus::Path;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 const DESTINATION: &str = "org.freedesktop.portal.Desktop";
@@ -16,6 +16,7 @@ const INTERFACE: &str = "org.freedesktop.portal.ScreenCast";
 const REQUEST_INTERFACE: &str = "org.freedesktop.portal.Request";
 const TIMEOUT: Duration = Duration::from_secs(5);
 static TOKEN: AtomicU64 = AtomicU64::new(0);
+static PORTAL_INTERACTION: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 pub(super) struct Source {
     pub node: u32,
@@ -24,6 +25,12 @@ pub(super) struct Source {
 }
 
 pub(super) fn source(output_name: &str) -> Result<Source> {
+    // Portal dialogs do not identify the requested output. Keep requests serialized so the
+    // message below unambiguously identifies which monitor the user should select.
+    let _interaction = PORTAL_INTERACTION
+        .lock()
+        .map_err(|_| anyhow!("ScreenCast portal interaction lock was poisoned"))?;
+
     let connection = Connection::new_session()?;
     let proxy = connection.with_proxy(DESTINATION, PATH, TIMEOUT);
 
