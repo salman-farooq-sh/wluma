@@ -55,7 +55,7 @@ fn distance(scale: Scale, als: u64, luma: u8, entry: &Entry) -> f64 {
     als_distance.hypot(luma_distance)
 }
 
-fn interpolate(entries: &[Entry], scale: Scale, als: u64, luma: u8) -> Option<u64> {
+fn interpolate_raw(entries: &[Entry], scale: Scale, als: u64, luma: u8) -> Option<f64> {
     let points = entries
         .iter()
         .filter_map(|entry| {
@@ -64,7 +64,7 @@ fn interpolate(entries: &[Entry], scale: Scale, als: u64, luma: u8) -> Option<u6
         })
         .collect::<Vec<_>>();
     if let Some((brightness, _)) = points.iter().find(|(_, distance)| *distance == 0.0) {
-        return Some(*brightness as u64);
+        return Some(*brightness);
     }
     let total_weight = points
         .iter()
@@ -77,5 +77,25 @@ fn interpolate(entries: &[Entry], scale: Scale, als: u64, luma: u8) -> Option<u6
         .iter()
         .map(|(brightness, distance)| brightness / distance.powi(2) / total_weight)
         .sum::<f64>();
-    Some(prediction as u64)
+    Some(prediction)
+}
+
+fn interpolate(entries: &[Entry], scale: Scale, als: u64, luma: u8) -> Option<u64> {
+    interpolate_raw(entries, scale, als, luma).map(|prediction| prediction.round() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interpolation_rounds_to_nearest_brightness() {
+        let entries = vec![
+            Entry::new(3, 0, 2),
+            Entry::new(18, 0, 1),
+            Entry::new(747, 0, 0),
+        ];
+
+        assert_eq!(interpolate(&entries, Scale::Lux, 5, 0), Some(2));
+    }
 }

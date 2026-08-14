@@ -128,8 +128,8 @@ impl Controller {
     }
 
     fn get_brightness_reduction(&mut self, current_brightness: u64, als: u64, luma: u8) -> u64 {
-        let brightness_reduction = super::interpolate(&self.points, self.scale, als, luma);
-        (current_brightness as f64 * brightness_reduction.unwrap_or(0) as f64 / 100.0) as u64
+        let brightness_reduction = super::interpolate_raw(&self.points, self.scale, als, luma);
+        (current_brightness as f64 * brightness_reduction.unwrap_or(0.0) / 100.0).round() as u64
     }
 
     fn process_brightness_change(&mut self, new_brightness: u64, als: u64, luma: u8) {
@@ -185,14 +185,15 @@ mod tests {
         assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 0), 0);
         assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 10), 2);
         assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 20), 11);
-        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 30), 22);
+        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 30), 23);
         assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 40), 29);
         assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 50), 30);
-        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 60), 30);
+        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 60), 31);
         assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 70), 37);
-        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 80), 48);
-        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 90), 57);
+        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 80), 49);
+        assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 90), 58);
         assert_eq!(controller.get_brightness_reduction(100, ALS_DIM, 100), 60);
+        assert_eq!(controller.get_brightness_reduction(1000, ALS_DIM, 10), 24);
 
         Ok(())
     }
@@ -232,7 +233,7 @@ mod tests {
         assert_eq!(prediction_rx.recv().await?, 128);
 
         controller.process(ALS_DIM, 80).await;
-        assert_eq!(prediction_rx.recv().await?, 82);
+        assert_eq!(prediction_rx.recv().await?, 81);
 
         Ok(())
     }
@@ -279,7 +280,7 @@ mod tests {
         controller.pending_cooldown.finish();
         controller.process(ALS_DIM, 50).await;
         assert!(!controller.pending_cooldown.is_active());
-        assert_eq!(87, prediction_rx.recv().await?);
+        assert_eq!(86, prediction_rx.recv().await?);
 
         Ok(())
     }

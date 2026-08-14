@@ -484,7 +484,7 @@ mod tests {
         // prediction = weight1*brightness1 + weight2*brightness2 + weight3*brightness
         controller.predict(ALS_DIM, 50).await;
 
-        assert_eq!(38, prediction_rx.try_recv()?);
+        assert_eq!(39, prediction_rx.try_recv()?);
         Ok(())
     }
 

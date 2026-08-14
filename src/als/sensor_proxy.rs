@@ -129,7 +129,7 @@ impl Drop for Sensor {
 
 fn light_level(value: f64) -> Result<u64> {
     if value.is_finite() && value >= 0.0 {
-        Ok(value as u64)
+        Ok(value.round() as u64)
     } else {
         Err(anyhow!("Invalid iio-sensor-proxy light level '{value}'"))
     }
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn converts_light_levels() {
-        assert_eq!(light_level(42.9).unwrap(), 42);
+        assert_eq!(light_level(42.9).unwrap(), 43);
         assert_eq!(light_level(0.0).unwrap(), 0);
         assert!(light_level(-1.0).is_err());
         assert!(light_level(f64::NAN).is_err());

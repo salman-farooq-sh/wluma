@@ -87,7 +87,7 @@ impl Als {
     async fn get_raw(&self) -> Result<u64> {
         match &self.source {
             Source::SensorProxy(sensor) => Ok(sensor.lock().await.get_raw().await),
-            Source::Sysfs(sensor) => Ok(match sensor.as_ref() {
+            Source::Sysfs(sensor) => Ok((match sensor.as_ref() {
                 SensorType::Illuminance { channel, .. } => read_channel(channel).await?,
                 SensorType::Rgb {
                     red, green, blue, ..
@@ -96,7 +96,8 @@ impl Als {
                         + 1.57837 * read(green.lock().await.deref_mut()).await?
                         + -0.73191 * read(blue.lock().await.deref_mut()).await?
                 }
-            } as u64),
+            })
+            .round() as u64),
         }
     }
 }
