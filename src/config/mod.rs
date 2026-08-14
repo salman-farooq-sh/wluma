@@ -220,6 +220,7 @@ fn parse_config_str(file_config: &str) -> Result<app::Config> {
                 capturer: match_capturer(o.capturer.unwrap_or_default()),
                 vulkan_device: o.vulkan_device.into(),
                 predictor: match_predictor(o.predictor.unwrap_or_default())?,
+                als_direction: crate::predictor::AlsDirection::Increasing,
             }))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -251,6 +252,7 @@ fn parse_config_str(file_config: &str) -> Result<app::Config> {
             capturer: Capturer::None,
             vulkan_device: app::VulkanDevice::Auto,
             predictor: app::Predictor::Adaptive,
+            als_direction: crate::predictor::AlsDirection::Decreasing,
         })
     }));
 
@@ -372,6 +374,27 @@ mod tests {
         assert!(!debug.contains("thresholds"));
         assert!(!debug.contains("\"night\""));
         assert!(matches!(config.als, app::Als::Auto { .. }));
+    }
+
+    #[test]
+    fn test_keyboard_uses_decreasing_als_direction() {
+        let config = parse_config_str(
+            r#"
+[[keyboard]]
+name = "keyboard"
+path = "/sys/class/leds/kbd_backlight"
+"#,
+        )
+        .unwrap();
+
+        match &config.output[0] {
+            app::Output::Backlight(output) => assert_eq!(
+                output.als_direction,
+                crate::predictor::AlsDirection::Decreasing
+            ),
+            _ => unreachable!(),
+        }
+        assert!(!format!("{config:#?}").contains("als_direction"));
     }
 
     #[test]

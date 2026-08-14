@@ -4,7 +4,10 @@ use super::{distance, Cooldown, INITIAL_TIMEOUT, PENDING_COOLDOWN};
 use crate::{
     als::{Reading, Scale},
     channel_ext::ReceiverExt,
-    predictor::data::{Data, Entry},
+    predictor::{
+        data::{Data, Entry},
+        AlsDirection,
+    },
 };
 use std::collections::HashMap;
 
@@ -22,6 +25,7 @@ pub struct Controller {
     last_als: Option<Reading>,
     output_name: String,
     scale: Scale,
+    als_direction: AlsDirection,
 }
 
 impl Controller {
@@ -52,7 +56,13 @@ impl Controller {
             last_als: None,
             output_name: output_name.to_string(),
             scale,
+            als_direction: AlsDirection::Increasing,
         }
+    }
+
+    pub fn with_als_direction(mut self, als_direction: AlsDirection) -> Self {
+        self.als_direction = als_direction;
+        self
     }
 
     pub async fn adjust(&mut self, luma: u8) {
@@ -149,10 +159,16 @@ impl Controller {
         self.data.entries.retain(|entry| {
             let nearby =
                 distance(self.scale, pending.als, pending.luma, entry) <= REPLACEMENT_DISTANCE;
-            let should_be_dimmer = entry.als <= pending.als && entry.luma >= pending.luma;
-            let should_be_brighter = entry.als >= pending.als && entry.luma <= pending.luma;
-            let conflict = (should_be_dimmer && entry.brightness > pending.brightness)
-                || (should_be_brighter && entry.brightness < pending.brightness);
+            let pending_should_be_brighter = match self.als_direction {
+                AlsDirection::Increasing => entry.als <= pending.als,
+                AlsDirection::Decreasing => entry.als >= pending.als,
+            } && entry.luma >= pending.luma;
+            let pending_should_be_dimmer = match self.als_direction {
+                AlsDirection::Increasing => entry.als >= pending.als,
+                AlsDirection::Decreasing => entry.als <= pending.als,
+            } && entry.luma <= pending.luma;
+            let conflict = (pending_should_be_brighter && entry.brightness > pending.brightness)
+                || (pending_should_be_dimmer && entry.brightness < pending.brightness);
             !nearby && !conflict
         });
 
@@ -374,6 +390,31 @@ mod tests {
                 Entry::new(20, 20, 30),
                 Entry::new(30, 10, 31),
                 Entry::new(30, 30, 30),
+            ],
+            controller.data.entries
+        );
+        Ok(())
+    }
+
+    #[apply(test!)]
+    async fn test_learn_cleanup_when_brightness_decreases_as_als_increases() -> Result<()> {
+        let (controller, _, _) = setup().await?;
+        let mut controller = controller.with_als_direction(AlsDirection::Decreasing);
+        controller.data.entries = vec![
+            Entry::new(ALS_DARK, 20, 31),
+            Entry::new(ALS_DARK, 20, 29),
+            Entry::new(ALS_BRIGHT, 20, 29),
+            Entry::new(ALS_BRIGHT, 20, 31),
+        ];
+        controller.pending = Some(Entry::new(ALS_DIM, 20, 30));
+
+        controller.learn();
+
+        assert_eq!(
+            vec![
+                Entry::new(ALS_DARK, 20, 31),
+                Entry::new(ALS_DIM, 20, 30),
+                Entry::new(ALS_BRIGHT, 20, 29),
             ],
             controller.data.entries
         );

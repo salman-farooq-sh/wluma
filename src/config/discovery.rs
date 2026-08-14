@@ -56,6 +56,7 @@ pub fn outputs() -> Vec<app::Output> {
                 vulkan_device: app::VulkanDevice::Auto,
                 min_brightness: 1,
                 predictor: app::Predictor::Adaptive,
+                als_direction: crate::predictor::AlsDirection::Increasing,
             }));
             continue;
         }
@@ -128,6 +129,7 @@ fn keyboards() -> Vec<app::Output> {
                 vulkan_device: app::VulkanDevice::Auto,
                 min_brightness: 0,
                 predictor: app::Predictor::Adaptive,
+                als_direction: crate::predictor::AlsDirection::Decreasing,
             }))
         })
         .collect()
@@ -319,6 +321,7 @@ mod tests {
             vulkan_device: app::VulkanDevice::Auto,
             min_brightness: 1,
             predictor: app::Predictor::Adaptive,
+            als_direction: crate::predictor::AlsDirection::Increasing,
         })
     }
 

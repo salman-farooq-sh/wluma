@@ -63,17 +63,31 @@ async fn main() {
             |(mut tasks, mut als_txs), output| {
                 let legacy_thresholds = legacy_thresholds.clone();
                 async move {
-                    let output_clone = output.clone();
-
                     let (als_tx, als_rx) = channel::bounded(128);
                     let (user_tx, user_rx) = channel::bounded(128);
                     let (prediction_tx, prediction_rx) = channel::bounded(128);
 
-                    let (output_name, output_capturer, vulkan_device) = match output_clone.clone() {
-                        config::Output::Backlight(cfg) => {
-                            (cfg.name, cfg.capturer, cfg.vulkan_device)
-                        }
-                        config::Output::DdcUtil(cfg) => (cfg.name, cfg.capturer, cfg.vulkan_device),
+                    let (
+                        output_name,
+                        output_capturer,
+                        vulkan_device,
+                        output_predictor,
+                        als_direction,
+                    ) = match &output {
+                        config::Output::Backlight(cfg) => (
+                            cfg.name.clone(),
+                            cfg.capturer.clone(),
+                            cfg.vulkan_device.clone(),
+                            cfg.predictor.clone(),
+                            cfg.als_direction,
+                        ),
+                        config::Output::DdcUtil(cfg) => (
+                            cfg.name.clone(),
+                            cfg.capturer.clone(),
+                            cfg.vulkan_device.clone(),
+                            cfg.predictor.clone(),
+                            predictor::AlsDirection::Increasing,
+                        ),
                     };
 
                     let brightness = match output {
@@ -96,13 +110,6 @@ async fn main() {
                                     .await;
                             }));
 
-                            let predictor = match output_clone.clone() {
-                                config::Output::Backlight(backlight_output) => {
-                                    backlight_output.predictor
-                                }
-                                config::Output::DdcUtil(ddcutil_output) => ddcutil_output.predictor,
-                            };
-
                             tasks.push(smol::spawn(async move {
                                 let frame_capturer: frame::capturer::Capturer =
                                     match output_capturer {
@@ -120,7 +127,7 @@ async fn main() {
                                         }
                                     };
 
-                                let controller = match predictor {
+                                let controller = match output_predictor {
                                     config::Predictor::Manual { points } => {
                                         predictor::Controller::Manual(
                                             predictor::controller::manual::Controller::new(
@@ -151,7 +158,8 @@ async fn main() {
                                             &output_name,
                                             als_scale,
                                             &legacy_thresholds,
-                                        ),
+                                        )
+                                        .with_als_direction(als_direction),
                                     ),
                                 };
 

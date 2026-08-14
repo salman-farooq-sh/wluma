@@ -122,7 +122,7 @@ impl fmt::Debug for VulkanDevice {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BacklightOutput {
     pub name: String,
     pub path: String,
@@ -130,6 +130,20 @@ pub struct BacklightOutput {
     pub vulkan_device: VulkanDevice,
     pub min_brightness: u64,
     pub predictor: Predictor,
+    pub als_direction: crate::predictor::AlsDirection,
+}
+
+impl fmt::Debug for BacklightOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BacklightOutput")
+            .field("name", &self.name)
+            .field("path", &self.path)
+            .field("capturer", &self.capturer)
+            .field("vulkan_device", &self.vulkan_device)
+            .field("min_brightness", &self.min_brightness)
+            .field("predictor", &self.predictor)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]

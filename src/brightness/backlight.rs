@@ -11,6 +11,12 @@ use std::path::Path;
 const TRANSITION_STEP_MS: u64 = 16;
 const BRIGHTNESS_STEPS: u64 = 1000;
 
+fn requires_polling(path: &Path) -> bool {
+    path.parent()
+        .and_then(Path::file_name)
+        .is_some_and(|subsystem| subsystem == "leds")
+}
+
 struct Dbus {
     connection: Connection,
     message: Message,
@@ -25,6 +31,7 @@ pub struct Backlight {
     dbus: Option<Dbus>,
     has_write_permission: bool,
     pending_dbus_write: bool,
+    poll_brightness: bool,
 }
 
 impl Backlight {
@@ -98,6 +105,8 @@ impl Backlight {
                 .add(&brightness_hw_changed_path, WatchMask::MODIFY)?;
         }
 
+        let poll_brightness = requires_polling(Path::new(path));
+
         Ok(Self {
             file,
             min_brightness,
@@ -107,6 +116,7 @@ impl Backlight {
             dbus,
             has_write_permission,
             pending_dbus_write: false,
+            poll_brightness,
         })
     }
 
@@ -115,6 +125,10 @@ impl Backlight {
             let value = read(&mut this.file).await? as u64;
             this.current = Some(value.clamp(this.min_brightness, this.max_brightness));
             Ok(value)
+        }
+
+        if self.poll_brightness {
+            return update(self).await;
         }
 
         let mut buffer = [0u8; 1024];
@@ -173,5 +187,24 @@ impl Backlight {
             Err(err) => Err(err.into()),
             _ => Ok(value),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn led_brightness_requires_polling() {
+        assert!(requires_polling(Path::new(
+            "/sys/class/leds/dell::kbd_backlight"
+        )));
+    }
+
+    #[test]
+    fn display_brightness_uses_inotify() {
+        assert!(!requires_polling(Path::new(
+            "/sys/class/backlight/intel_backlight"
+        )));
     }
 }
