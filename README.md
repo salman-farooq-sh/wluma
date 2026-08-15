@@ -74,7 +74,7 @@ The `config.toml` in repository represents default config values. To change them
 
 ### ALS
 
-When ALS configuration is omitted, wluma first uses an external ALS if `$XDG_RUNTIME_DIR/wluma/als.sock` is a Unix socket, then an IIO ambient light sensor when one is available, and otherwise continues without one. For IIO it first tries `iio-sensor-proxy` over the system D-Bus and then direct IIO discovery under `/sys/bus/iio/devices`.
+When ALS configuration is omitted, wluma uses an external ALS whenever `$XDG_RUNTIME_DIR/wluma/als.sock` is a Unix socket, otherwise it uses an available IIO ambient light sensor or continues without one. This selection is updated while wluma is running as sources appear and disappear. For IIO it first tries `iio-sensor-proxy` over the system D-Bus and then direct IIO discovery under `/sys/bus/iio/devices`.
 
 Explicit `[als.external]`, `[als.iio]`, `[als.webcam]`, `[als.time]` and `[als.none]` sections override automatic selection. The IIO `path` enables direct polling from a different sysfs directory when `iio-sensor-proxy` is unavailable.
 
@@ -91,7 +91,7 @@ path = "/run/user/1000/home-assistant/als.sock"
 scale = "linear"
 ```
 
-The `lux` scale accepts illuminance values without an upper bound. The `linear` scale accepts normalized values from 0 to 100. The socket must exist before wluma starts for automatic detection.
+The `lux` scale accepts illuminance values without an upper bound. The `linear` scale accepts normalized values from 0 to 100. The socket is detected whether it exists before wluma starts or appears later.
 
 Webcam ALS reports perceived camera-frame lightness from 0 to 100. Time ALS uses a circular, linearly interpolated schedule of synthetic light levels:
 
@@ -104,7 +104,7 @@ The adaptive predictor stores numeric ALS readings and continuously interpolates
 
 ### Displays
 
-The entire `output` section is optional. At startup, wluma discovers connected DRM outputs, associates internal panels with `/sys/class/backlight` devices and external monitors with DDC using their EDID, and automatically selects a screen capturer. Disconnected outputs are ignored. DDC is known to often be problematic, so always consider trying [ddcci-driver-linux](https://gitlab.com/ddcci-driver-linux/ddcci-driver-linux) first if you can.
+The entire `output` section is optional. Wluma continuously discovers connected DRM outputs, associates internal panels with `/sys/class/backlight` devices and external monitors with DDC using their EDID, and automatically selects a screen capturer. Automatically discovered outputs and keyboards are started and stopped as they appear and disappear. DDC is known to often be problematic, so always consider trying [ddcci-driver-linux](https://gitlab.com/ddcci-driver-linux/ddcci-driver-linux) first if you can.
 
 To override the capturer or predictor for a discovered output, use the detected brightness type and DRM connector name reported with `RUST_LOG=debug`:
 
@@ -209,12 +209,6 @@ This is a useful test to validate that wluma does indeed see the screen contents
    ```
 
 If your results do not match, please open an issue and let's investigate!
-
-## Known issues (help wanted!)
-
-Help is wanted and much appreciated! If you want to implement some of these, feel free to open an issue and I'll provide more details and try to help you along the way.
-
-- Plugging in a screen while `wluma` is running. Workaround: restart `wluma`.
 
 ## Relevant projects
 

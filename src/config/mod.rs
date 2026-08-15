@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
-use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 mod app;
 mod discovery;
@@ -10,22 +9,15 @@ use anyhow::{anyhow, Result};
 pub use app::*;
 
 pub fn load() -> Result<app::Config> {
-    let mut config = parse()?;
-    if let app::Als::Auto { thresholds } = &config.als {
-        if let Some(path) = external_socket_path().filter(|path| {
-            path.metadata()
-                .is_ok_and(|metadata| metadata.file_type().is_socket())
-        }) {
-            log::info!("Using external ALS at '{}'", path.display());
-            config.als = app::Als::External {
-                path: path.to_string_lossy().into_owned(),
-                scale: crate::als::Scale::Lux,
-                thresholds: thresholds.clone(),
-            };
-        }
-    }
-    config.output = discovery::merge(config.output, discovery::outputs());
-    validate(config)
+    validate(parse()?)
+}
+
+pub fn detected_outputs(configured: Vec<app::Output>) -> Vec<app::Output> {
+    discovery::merge(configured, discovery::outputs())
+}
+
+pub fn topology() -> Vec<String> {
+    discovery::topology()
 }
 
 fn external_socket_path() -> Option<PathBuf> {
@@ -356,10 +348,10 @@ fn validate(config: app::Config) -> Result<app::Config> {
         })
         .collect::<HashSet<_>>();
 
-    match (names.len(), names.len() == config.output.len()) {
-        (0, _) => Err(anyhow!("No connected output or keyboard detected")),
-        (_, false) => Err(anyhow!("Names of all outputs and keyboards are not unique")),
-        _ => Ok(config),
+    if names.len() != config.output.len() {
+        Err(anyhow!("Names of all outputs and keyboards are not unique"))
+    } else {
+        Ok(config)
     }
 }
 
@@ -369,7 +361,7 @@ mod tests {
 
     #[test]
     fn test_empty_config_uses_auto_als() {
-        let config = parse_config_str("").unwrap();
+        let config = validate(parse_config_str("").unwrap()).unwrap();
         let debug = format!("{config:#?}");
         assert!(!debug.contains("thresholds"));
         assert!(!debug.contains("\"night\""));

@@ -1,4 +1,4 @@
-use smol::channel::Sender;
+use smol::channel::{Receiver, Sender};
 use smol::Timer;
 use std::time::{Duration, Instant};
 
@@ -119,18 +119,25 @@ fn near(scale: Scale, left: u64, right: u64) -> bool {
 pub struct Controller {
     als: Als,
     value_txs: Vec<Sender<Reading>>,
+    registrations: Receiver<Sender<Reading>>,
     stabilizer: Stabilizer,
     last_observation: Option<Instant>,
+    last_reading: Option<Reading>,
+    generation: u64,
 }
 
 impl Controller {
-    pub fn new(als: Als, value_txs: Vec<Sender<Reading>>) -> Self {
+    pub fn new(als: Als, registrations: Receiver<Sender<Reading>>) -> Self {
         let stabilizer = Stabilizer::new(als.scale());
+        let generation = als.generation();
         Self {
             als,
-            value_txs,
+            value_txs: Vec::new(),
+            registrations,
             stabilizer,
             last_observation: None,
+            last_reading: None,
+            generation,
         }
     }
 
@@ -141,9 +148,25 @@ impl Controller {
     }
 
     async fn step(&mut self) {
+        self.register().await;
         let started = Instant::now();
         match self.als.get().await {
             Ok(Some(value)) => {
+                let generation = self.als.generation();
+                if generation != self.generation {
+                    self.generation = generation;
+                    self.stabilizer = Stabilizer::new(self.als.scale());
+                    self.last_observation = None;
+                    let reading = Reading {
+                        value,
+                        stable: false,
+                    };
+                    self.last_reading = Some(reading);
+                    self.value_txs.retain(|channel| !channel.is_closed());
+                    for channel in &self.value_txs {
+                        let _ = channel.try_send(reading);
+                    }
+                }
                 let now = Instant::now();
                 let interval = self
                     .last_observation
@@ -152,11 +175,11 @@ impl Controller {
                         now.duration_since(previous)
                     });
                 if let Some(reading) = self.stabilizer.observe(value, interval, now) {
-                    futures_util::future::try_join_all(
-                        self.value_txs.iter().map(|channel| channel.send(reading)),
-                    )
-                    .await
-                    .expect("Unable to send new ALS value, channel is dead");
+                    self.last_reading = Some(reading);
+                    self.value_txs.retain(|channel| !channel.is_closed());
+                    for channel in &self.value_txs {
+                        let _ = channel.try_send(reading);
+                    }
                 }
             }
             Ok(None) => {}
@@ -165,6 +188,17 @@ impl Controller {
 
         if let Some(remaining) = self.als.poll_interval().checked_sub(started.elapsed()) {
             Timer::after(remaining).await;
+        }
+    }
+
+    async fn register(&mut self) {
+        while let Ok(channel) = self.registrations.try_recv() {
+            if let Some(reading) = self.last_reading {
+                if channel.send(reading).await.is_err() {
+                    continue;
+                }
+            }
+            self.value_txs.push(channel);
         }
     }
 }
@@ -230,5 +264,22 @@ mod tests {
             }),
             stabilizer.observe(10, Duration::ZERO, start + Duration::from_secs(1))
         );
+    }
+
+    #[test]
+    fn new_subscriber_receives_latest_reading() {
+        smol::block_on(async {
+            let (registration_tx, registration_rx) = smol::channel::unbounded();
+            let mut controller = Controller::new(Als::None(Default::default()), registration_rx);
+            let reading = Reading {
+                value: 42,
+                stable: true,
+            };
+            controller.last_reading = Some(reading);
+            let (value_tx, value_rx) = smol::channel::bounded(1);
+            registration_tx.send(value_tx).await.unwrap();
+            controller.register().await;
+            assert_eq!(value_rx.recv().await.unwrap(), reading);
+        });
     }
 }

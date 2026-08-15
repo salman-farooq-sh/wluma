@@ -17,18 +17,31 @@ struct Backlight {
     rank: u8,
 }
 
+pub fn topology() -> Vec<String> {
+    let mut topology = connectors()
+        .into_iter()
+        .map(|connector| format!("drm:{}:{:02x?}", connector.name, connector.edid))
+        .collect::<Vec<_>>();
+    topology.extend(
+        read_dir("/sys/class/backlight")
+            .into_iter()
+            .map(|path| format!("backlight:{}", path.display())),
+    );
+    topology.extend(read_dir("/sys/class/leds").into_iter().filter_map(|path| {
+        let name = path.file_name()?.to_str()?;
+        name.to_ascii_lowercase()
+            .contains("kbd_backlight")
+            .then(|| format!("keyboard:{}", path.display()))
+    }));
+    topology.sort();
+    topology
+}
+
 pub fn outputs() -> Vec<app::Output> {
     let connectors = connectors();
     let mut backlights = backlights(&connectors);
     let mut used_backlights = HashSet::new();
-    let mut displays = Display::enumerate();
-    let display_identifier_counts = displays.iter().filter_map(display_identifier).fold(
-        HashMap::new(),
-        |mut counts, identifier| {
-            *counts.entry(identifier).or_insert(0) += 1;
-            counts
-        },
-    );
+    let mut displays = None;
     let mut outputs = Vec::new();
 
     for connector in connectors {
@@ -44,11 +57,6 @@ pub fn outputs() -> Vec<app::Output> {
 
         if let Some((index, backlight)) = backlight {
             used_backlights.insert(index);
-            log::debug!(
-                "Discovered output '{}' using backlight {}",
-                connector.name,
-                backlight.path.display()
-            );
             outputs.push(app::Output::Backlight(app::BacklightOutput {
                 name: connector.name,
                 path: backlight.path.to_string_lossy().into_owned(),
@@ -61,6 +69,17 @@ pub fn outputs() -> Vec<app::Output> {
             continue;
         }
 
+        let (displays, display_identifier_counts) = displays.get_or_insert_with(|| {
+            let displays = Display::enumerate();
+            let counts = displays.iter().filter_map(display_identifier).fold(
+                HashMap::new(),
+                |mut counts, identifier| {
+                    *counts.entry(identifier).or_insert(0) += 1;
+                    counts
+                },
+            );
+            (displays, counts)
+        });
         let display = displays.iter().position(|display| {
             display
                 .info
@@ -72,11 +91,6 @@ pub fn outputs() -> Vec<app::Output> {
             let display = displays.swap_remove(index);
             if let Some(identifier) = display_identifier(&display) {
                 if display_identifier_counts.get(&identifier) == Some(&1) {
-                    log::debug!(
-                        "Discovered output '{}' using DDC identifier '{}'",
-                        connector.name,
-                        identifier
-                    );
                     outputs.push(app::Output::DdcUtil(app::DdcUtilOutput {
                         name: connector.name,
                         identifier,
@@ -117,11 +131,6 @@ fn keyboards() -> Vec<app::Output> {
             {
                 return None;
             }
-            log::debug!(
-                "Discovered keyboard '{}' using backlight {}",
-                name,
-                path.display()
-            );
             Some(app::Output::Backlight(app::BacklightOutput {
                 name,
                 path: path.to_string_lossy().into_owned(),

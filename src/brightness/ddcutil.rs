@@ -18,6 +18,8 @@ const DDC_CLI_WAITING_SLEEP_MS: u64 = 800;
 const DDC_CLI_TRANSITION_STEP_MS: u64 = 100;
 const DDC_DIRECT_RETRIES: usize = 3;
 const DDC_DIRECT_RETRY_SLEEP_MS: u64 = 40;
+const DDC_INITIALIZATION_ATTEMPTS: usize = 6;
+const DDC_INITIALIZATION_RETRY_SLEEP_MS: u64 = 1000;
 const DDC_CLI_RETRIES: usize = 3;
 const DDC_CLI_RETRY_SLEEP_MS: u64 = 150;
 
@@ -38,7 +40,7 @@ impl DdcUtil {
         let direct_error = match find_display_by_identifier(identifier, true)
             .or_else(|| find_display_by_identifier(identifier, false))
         {
-            Some(mut display) => match get_max_brightness_with_retry(&mut display) {
+            Some(mut display) => match initialize_direct(&mut display) {
                 Ok(max_brightness) => {
                     return Ok(Self {
                         identifier: identifier.to_string(),
@@ -178,8 +180,21 @@ fn get_max_brightness(display: &mut Display) -> Result<u64> {
         .maximum() as u64)
 }
 
-fn get_max_brightness_with_retry(display: &mut Display) -> Result<u64> {
-    retry_ddc("read max brightness", || get_max_brightness(display))
+fn initialize_direct(display: &mut Display) -> Result<u64> {
+    for attempt in 1..=DDC_INITIALIZATION_ATTEMPTS {
+        match get_max_brightness(display) {
+            Ok(max_brightness) => return Ok(max_brightness),
+            Err(error) if attempt < DDC_INITIALIZATION_ATTEMPTS => {
+                log::debug!(
+                    "Unable to initialize direct DDC (attempt {attempt}/{DDC_INITIALIZATION_ATTEMPTS}): {error:?}"
+                );
+                thread::sleep(Duration::from_millis(DDC_INITIALIZATION_RETRY_SLEEP_MS));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("initialization retry loop always returns before falling through")
 }
 
 fn get_brightness_with_retry(display: &mut Display) -> Result<u64> {

@@ -1,4 +1,3 @@
-use futures_util::stream::{self, StreamExt};
 use macro_rules_attribute::apply;
 use smol::channel;
 
@@ -9,6 +8,7 @@ mod config;
 mod device_file;
 mod frame;
 mod predictor;
+mod runtime;
 mod state;
 
 /// Current app version (determined at compile-time).
@@ -39,7 +39,7 @@ async fn main() {
 
     let config = match config::load() {
         Ok(config) => config,
-        Err(err) => panic!("Unable to load config: {}", err),
+        Err(error) => panic!("Unable to load config: {error}"),
     };
 
     log::debug!("Using {:#?}", config);
@@ -57,142 +57,9 @@ async fn main() {
         config::Als::None => (als::Scale::Linear, Default::default()),
     };
 
-    let (mut tasks, als_txs) = stream::iter(config.output.clone())
-        .fold(
-            (Vec::new(), Vec::new()),
-            |(mut tasks, mut als_txs), output| {
-                let legacy_thresholds = legacy_thresholds.clone();
-                async move {
-                    let (als_tx, als_rx) = channel::bounded(128);
-                    let (user_tx, user_rx) = channel::bounded(128);
-                    let (prediction_tx, prediction_rx) = channel::bounded(128);
-
-                    let (
-                        output_name,
-                        output_capturer,
-                        vulkan_device,
-                        output_predictor,
-                        als_direction,
-                    ) = match &output {
-                        config::Output::Backlight(cfg) => (
-                            cfg.name.clone(),
-                            cfg.capturer.clone(),
-                            cfg.vulkan_device.clone(),
-                            cfg.predictor.clone(),
-                            cfg.als_direction,
-                        ),
-                        config::Output::DdcUtil(cfg) => (
-                            cfg.name.clone(),
-                            cfg.capturer.clone(),
-                            cfg.vulkan_device.clone(),
-                            cfg.predictor.clone(),
-                            predictor::AlsDirection::Increasing,
-                        ),
-                    };
-
-                    let brightness = match output {
-                        config::Output::Backlight(cfg) => {
-                            brightness::Backlight::new(&cfg.path, cfg.min_brightness)
-                                .await
-                                .map(brightness::Brightness::Backlight)
-                        }
-                        config::Output::DdcUtil(cfg) => {
-                            brightness::DdcUtil::new(&cfg.identifier, cfg.min_brightness)
-                                .map(brightness::Brightness::DdcUtil)
-                        }
-                    };
-
-                    match brightness {
-                        Ok(b) => {
-                            tasks.push(smol::spawn(async {
-                                brightness::Controller::new(b, user_tx, prediction_rx)
-                                    .run()
-                                    .await;
-                            }));
-
-                            tasks.push(smol::spawn(async move {
-                                let frame_capturer: frame::capturer::Capturer =
-                                    match output_capturer {
-                                        config::Capturer::Auto => frame::capturer::Capturer::Auto,
-                                        config::Capturer::Wayland(protocol) => {
-                                            frame::capturer::Capturer::Wayland(
-                                                frame::capturer::wayland::Capturer::new(protocol),
-                                            )
-                                        }
-                                        config::Capturer::Pipewire(protocol) => {
-                                            frame::capturer::Capturer::Pipewire(protocol)
-                                        }
-                                        config::Capturer::None => {
-                                            frame::capturer::Capturer::None(Default::default())
-                                        }
-                                    };
-
-                                let controller = match output_predictor {
-                                    config::Predictor::Manual { points } => {
-                                        predictor::Controller::Manual(
-                                            predictor::controller::manual::Controller::new(
-                                                prediction_tx,
-                                                user_rx,
-                                                als_rx,
-                                                points
-                                                    .into_iter()
-                                                    .map(|point| {
-                                                        predictor::Entry::new(
-                                                            point.als,
-                                                            point.luma,
-                                                            point.reduction,
-                                                        )
-                                                    })
-                                                    .collect(),
-                                                &output_name,
-                                                als_scale,
-                                            ),
-                                        )
-                                    }
-                                    config::Predictor::Adaptive => predictor::Controller::Adaptive(
-                                        predictor::controller::adaptive::Controller::new(
-                                            prediction_tx,
-                                            user_rx,
-                                            als_rx,
-                                            true,
-                                            &output_name,
-                                            als_scale,
-                                            &legacy_thresholds,
-                                        )
-                                        .with_als_direction(als_direction),
-                                    ),
-                                };
-
-                                frame_capturer
-                                    .run(&output_name, controller, vulkan_device.as_deref())
-                                    .await;
-                            }));
-
-                            als_txs.push(als_tx);
-                        }
-                        Err(err) => {
-                            log::warn!(
-                                "Skipping '{}' as it might be disconnected: {}",
-                                output_name,
-                                err
-                            );
-                        }
-                    }
-
-                    (tasks, als_txs)
-                }
-            },
-        )
-        .await;
-
-    let als: als::Als = match config.als {
-        config::Als::Auto { .. } => match als::iio::Als::new(Some("/sys/bus/iio/devices")).await {
-            Ok(sensor) => als::Als::Iio(sensor),
-            Err(error) => {
-                log::info!("No ambient light sensor detected, continuing without one: {error}");
-                als::Als::None(Default::default())
-            }
-        },
+    let mut webcam_task = None;
+    let source = match config.als {
+        config::Als::Auto { .. } => als::Als::Auto(Default::default()),
         config::Als::External { path, scale, .. } => {
             als::Als::External(als::external::Als::new(path, scale))
         }
@@ -207,7 +74,7 @@ async fn main() {
         config::Als::Webcam { video, .. } => als::Als::Webcam({
             let (webcam_tx, webcam_rx) = channel::bounded(128);
             // TODO: make async
-            tasks.push(smol::unblock(move || {
+            webcam_task = Some(smol::unblock(move || {
                 als::webcam::Webcam::new(webcam_tx, video).run();
             }));
             als::webcam::Als::new(webcam_rx)
@@ -215,11 +82,18 @@ async fn main() {
         config::Als::None => als::Als::None(Default::default()),
     };
 
-    tasks.push(smol::spawn(async {
-        als::controller::Controller::new(als, als_txs).run().await;
-    }));
+    let (registration_tx, registration_rx) = channel::unbounded();
+    let als_task = smol::spawn(async move {
+        als::controller::Controller::new(source, registration_rx)
+            .run()
+            .await;
+    });
 
     log::info!("Continue adjusting brightness and wluma will learn your preference over time.");
 
-    futures_util::future::join_all(tasks).await;
+    let mut runtime =
+        runtime::Runtime::new(config.output, als_scale, legacy_thresholds, registration_tx);
+    runtime.run().await;
+    drop(als_task);
+    drop(webcam_task);
 }

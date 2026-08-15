@@ -447,7 +447,7 @@ impl Vulkan {
             }
         }
         log::debug!(
-            "Vulkan supported DMA-BUF modifiers: DRM format={drm_format}, Vulkan format={}, required_external_feature={:#x}, modifiers={supported:#x?}",
+            "Vulkan supported DMA-BUF modifiers: DRM format={drm_format}, Vulkan format={}, required_external_feature={:#x}, modifiers={supported:x?}",
             format.as_raw(),
             required_external_feature.as_raw(),
         );

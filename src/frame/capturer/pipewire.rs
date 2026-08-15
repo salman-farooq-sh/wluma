@@ -8,6 +8,8 @@ use pipewire as pw;
 use pw::spa;
 use pw::spa::pod::Pod;
 use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod kwin;
@@ -25,10 +27,12 @@ pub fn run(
     protocol: PipewireProtocol,
     controller: Controller,
     vulkan_device: Option<&str>,
+    active: Arc<AtomicBool>,
 ) {
-    let source = prepare(output_name, protocol)
-        .unwrap_or_else(|error| panic!("Unable to create PipeWire screen stream: {error:#}"));
-    run_prepared(source, controller, vulkan_device);
+    match prepare(output_name, protocol) {
+        Ok(source) => run_prepared(source, controller, vulkan_device, active),
+        Err(error) => log::error!("Unable to create PipeWire screen stream: {error:#}"),
+    }
 }
 
 pub(super) fn prepare(output_name: &str, protocol: PipewireProtocol) -> Result<Source> {
@@ -45,9 +49,15 @@ pub(super) fn prepare(output_name: &str, protocol: PipewireProtocol) -> Result<S
     }
 }
 
-pub(super) fn run_prepared(source: Source, controller: Controller, vulkan_device: Option<&str>) {
-    capture(source.0, source.1, controller, vulkan_device)
-        .unwrap_or_else(|error| panic!("Unable to capture PipeWire screen stream: {error:#}"));
+pub(super) fn run_prepared(
+    source: Source,
+    controller: Controller,
+    vulkan_device: Option<&str>,
+    active: Arc<AtomicBool>,
+) {
+    if let Err(error) = capture(source.0, source.1, controller, vulkan_device, active) {
+        log::error!("Unable to capture PipeWire screen stream: {error:#}");
+    }
 }
 
 fn automatic_source(output_name: &str) -> Result<Source> {
@@ -85,9 +95,20 @@ fn capture(
     portal: Option<Portal>,
     controller: Controller,
     vulkan_device: Option<&str>,
+    active: Arc<AtomicBool>,
 ) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
+    let timer_loop = mainloop.clone();
+    let shutdown_timer = mainloop.loop_().add_timer(move |_| {
+        if !active.load(Ordering::Relaxed) {
+            timer_loop.quit();
+        }
+    });
+    shutdown_timer.update_timer(
+        Some(Duration::from_millis(100)),
+        Some(Duration::from_millis(100)),
+    );
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let (core, _portal_connection) = match portal {
         Some((remote, connection)) => {
@@ -114,19 +135,24 @@ fn capture(
             "Vulkan cannot import any common single-plane PipeWire DMA-BUF modifier"
         ));
     }
-    log::debug!("Advertising PipeWire DRM modifiers {modifiers:#x?}");
+    log::debug!("Advertising PipeWire DRM modifiers {modifiers:x?}");
     let data = Data {
         controller,
         format: Default::default(),
         vulkan,
         last_frame_at: None,
     };
+    let stream_loop = mainloop.clone();
     let _listener = stream
         .add_local_listener_with_user_data(data)
-        .state_changed(|_, _, old, new| match new {
-            pw::stream::StreamState::Error(error) => panic!("PipeWire stream failed: {error}"),
+        .state_changed(move |_, _, old, new| match new {
+            pw::stream::StreamState::Error(error) => {
+                log::error!("PipeWire stream failed: {error}");
+                stream_loop.quit();
+            }
             pw::stream::StreamState::Unconnected if old != pw::stream::StreamState::Unconnected => {
-                panic!("PipeWire stream disconnected");
+                log::debug!("PipeWire stream disconnected");
+                stream_loop.quit();
             }
             _ => {}
         })

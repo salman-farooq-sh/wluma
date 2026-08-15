@@ -84,6 +84,13 @@ impl Als {
         }
     }
 
+    pub fn backend_name(&self) -> &'static str {
+        match &self.source {
+            Source::SensorProxy(_) => "iio-sensor-proxy",
+            Source::Sysfs(_) => "sysfs",
+        }
+    }
+
     async fn get_raw(&self) -> Result<u64> {
         match &self.source {
             Source::SensorProxy(sensor) => Ok(sensor.lock().await.get_raw().await),

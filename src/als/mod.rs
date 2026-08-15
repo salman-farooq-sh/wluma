@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::time::Duration;
 
+pub mod auto;
 pub mod controller;
 pub mod external;
 pub mod iio;
@@ -44,6 +45,7 @@ pub struct Reading {
 
 #[allow(clippy::large_enum_variant)]
 pub enum Als {
+    Auto(auto::Als),
     Webcam(webcam::Als),
     External(external::Als),
     Iio(iio::Als),
@@ -54,6 +56,7 @@ pub enum Als {
 impl Als {
     pub async fn get(&self) -> Result<Option<u64>> {
         match self {
+            Self::Auto(als) => als.get().await,
             Self::Webcam(als) => als.get().await,
             Self::External(als) => als.get().await.map(Some),
             Self::Iio(als) => als.get().await.map(Some),
@@ -64,6 +67,7 @@ impl Als {
 
     pub fn poll_interval(&self) -> Duration {
         match self {
+            Self::Auto(als) => als.poll_interval(),
             Self::External(als) => als.poll_interval(),
             Self::Iio(als) => als.poll_interval(),
             Self::Webcam(_) | Self::Time(_) | Self::None(_) => DEFAULT_POLL_INTERVAL,
@@ -72,9 +76,17 @@ impl Als {
 
     pub fn scale(&self) -> Scale {
         match self {
+            Self::Auto(_) => Scale::Lux,
             Self::External(als) => als.scale(),
             Self::Iio(_) => Scale::Lux,
             Self::Webcam(_) | Self::Time(_) | Self::None(_) => Scale::Linear,
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        match self {
+            Self::Auto(als) => als.generation(),
+            _ => 0,
         }
     }
 }

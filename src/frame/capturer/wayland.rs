@@ -3,7 +3,9 @@ use crate::frame::object::Object;
 use crate::frame::vulkan::Vulkan;
 use crate::predictor::Controller;
 use anyhow::{Context, Result};
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use wayland_client::protocol::wl_buffer::WlBuffer;
@@ -135,7 +137,13 @@ impl Capturer {
             || capturer.dmabuf_manager.is_some())
     }
 
-    pub fn run(&mut self, output_name: &str, controller: Controller, vulkan_device: Option<&str>) {
+    pub fn run(
+        &mut self,
+        output_name: &str,
+        controller: Controller,
+        vulkan_device: Option<&str>,
+        active: Arc<AtomicBool>,
+    ) {
         self.vulkan_device = vulkan_device.map(str::to_string);
         let connection =
             Connection::connect_to_env().expect("Unable to connect to Wayland display");
@@ -226,7 +234,7 @@ impl Capturer {
         );
         self.controller = Some(controller);
 
-        loop {
+        while active.load(Ordering::Relaxed) {
             if !self.is_processing_frame {
                 if let Some(output) = self.output.as_ref() {
                     match protocol_to_use {
@@ -294,8 +302,20 @@ impl Capturer {
             }
 
             event_queue
-                .blocking_dispatch(self)
-                .expect("Error running wayland capturer main loop");
+                .dispatch_pending(self)
+                .expect("Error dispatching Wayland events");
+            connection.flush().expect("Error flushing Wayland requests");
+            if let Some(guard) = event_queue.prepare_read() {
+                let mut fd = libc::pollfd {
+                    fd: connection.as_fd().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ready = unsafe { libc::poll(&mut fd, 1, 200) };
+                if ready > 0 {
+                    guard.read().expect("Error reading Wayland events");
+                }
+            }
         }
     }
 }
@@ -841,7 +861,7 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for Capturer {
                     .map(|bytes| u64::from_ne_bytes(bytes.try_into().unwrap()))
                     .collect();
                 log::debug!(
-                    "ext-image-copy-capture DMA-BUF format constraint: DRM format={format}, modifiers={modifiers:#x?}"
+                    "ext-image-copy-capture DMA-BUF format constraint: DRM format={format}, modifiers={modifiers:x?}"
                 );
                 state.dmabuf_formats.push((format, modifiers));
             }
@@ -874,7 +894,7 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for Capturer {
                     "No compositor-provided DMA-BUF format and modifier can be exported by Vulkan",
                 );
                 log::debug!(
-                    "ext-image-copy-capture selected DMA-BUF constraints: DRM format={format}, size={}x{}, modifiers={modifiers:#x?}",
+                    "ext-image-copy-capture selected DMA-BUF constraints: DRM format={format}, size={}x{}, modifiers={modifiers:x?}",
                     dimensions.0,
                     dimensions.1,
                 );

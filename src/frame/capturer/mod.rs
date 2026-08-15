@@ -2,6 +2,9 @@ pub mod none;
 pub mod pipewire;
 pub mod wayland;
 
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
 #[allow(clippy::large_enum_variant)]
 pub enum Capturer {
     Auto,
@@ -16,6 +19,7 @@ impl Capturer {
         output_name: &str,
         controller: crate::predictor::Controller,
         vulkan_device: Option<&str>,
+        active: Arc<AtomicBool>,
     ) {
         match self {
             Capturer::Auto => {
@@ -29,6 +33,7 @@ impl Capturer {
                                 &output,
                                 controller,
                                 vulkan_device.as_deref(),
+                                active,
                             );
                             return;
                         }
@@ -47,31 +52,39 @@ impl Capturer {
                                 source,
                                 controller,
                                 vulkan_device.as_deref(),
+                                active,
                             );
                         }
                         Err(error) => {
                             log::warn!(
                                 "No supported screen capture protocol found for '{output}', using ALS only: {error:#}"
                             );
-                            smol::block_on(none::Capturer::default().run(&output, controller));
+                            smol::block_on(none::Capturer::default().run(&output, controller, active));
                         }
                     }
                 })
                 .await;
             }
-            Capturer::None(mut c) => c.run(output_name, controller).await,
+            Capturer::None(mut c) => c.run(output_name, controller, active).await,
             Capturer::Pipewire(protocol) => {
                 let output = output_name.to_string();
                 let vulkan_device = vulkan_device.map(str::to_string);
                 smol::unblock(move || {
-                    pipewire::run(&output, protocol, controller, vulkan_device.as_deref())
+                    pipewire::run(
+                        &output,
+                        protocol,
+                        controller,
+                        vulkan_device.as_deref(),
+                        active,
+                    )
                 })
                 .await;
             }
             Capturer::Wayland(mut c) => {
                 let output = output_name.to_string();
                 let vulkan_device = vulkan_device.map(str::to_string);
-                smol::unblock(move || c.run(&output, controller, vulkan_device.as_deref())).await;
+                smol::unblock(move || c.run(&output, controller, vulkan_device.as_deref(), active))
+                    .await;
             }
         }
     }

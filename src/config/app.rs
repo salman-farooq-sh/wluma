@@ -28,7 +28,7 @@ pub enum PipewireProtocol {
     Mutter,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Capturer {
     Auto,
     Wayland(WaylandProtocol),
@@ -85,13 +85,13 @@ pub struct ManualPoint {
     pub reduction: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Predictor {
     Adaptive,
     Manual { points: Vec<ManualPoint> },
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub enum VulkanDevice {
     #[default]
     Auto,
@@ -122,7 +122,7 @@ impl fmt::Debug for VulkanDevice {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct BacklightOutput {
     pub name: String,
     pub path: String,
@@ -146,7 +146,7 @@ impl fmt::Debug for BacklightOutput {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DdcUtilOutput {
     pub name: String,
     pub identifier: String,
@@ -157,7 +157,7 @@ pub struct DdcUtilOutput {
     pub predictor: Predictor,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Output {
     Backlight(BacklightOutput),
     DdcUtil(DdcUtilOutput),
