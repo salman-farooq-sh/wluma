@@ -110,8 +110,39 @@ pub struct Keyboard {
 }
 
 #[derive(Deserialize, Debug, Default)]
+#[serde(default)]
+pub struct IdleProfile {
+    pub enabled: Option<bool>,
+    pub timeout: Option<u64>,
+    pub brightness: Option<u8>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(default)]
+pub struct Idle {
+    pub enabled: bool,
+    pub timeout: u64,
+    pub brightness: u8,
+    pub ac: IdleProfile,
+    pub battery: IdleProfile,
+}
+
+impl Default for Idle {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout: 120,
+            brightness: 30,
+            ac: IdleProfile::default(),
+            battery: IdleProfile::default(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Default)]
 pub struct Config {
     pub als: Option<Als>,
+    pub idle: Option<Idle>,
     #[serde(default)]
     pub output: OutputByType,
     #[serde(default)]

@@ -9,6 +9,7 @@ mod config;
 mod control;
 mod device_file;
 mod frame;
+mod idle;
 mod predictor;
 mod runtime;
 mod state;
@@ -91,6 +92,10 @@ async fn main() {
         config::Als::None => (als::Scale::Linear, Default::default()),
     };
 
+    let idle_config = config.idle;
+    if let Some(idle) = idle_config {
+        status.set_idle_profile("ac", idle.ac.enabled, idle.ac.timeout, idle.ac.brightness);
+    }
     let mut webcam_task = None;
     let source = match config.als {
         config::Als::Auto { .. } => als::Als::Auto(Default::default()),
@@ -125,6 +130,26 @@ async fn main() {
             .await;
     });
 
+    let (idle_task, idle_rx) = if let Some(idle_config) = idle_config {
+        let (idle_tx, idle_rx) = channel::unbounded();
+        let ac_timeout = idle_config
+            .ac
+            .enabled
+            .then(|| std::time::Duration::from_secs(idle_config.ac.timeout));
+        let battery_timeout = idle_config
+            .battery
+            .enabled
+            .then(|| std::time::Duration::from_secs(idle_config.battery.timeout));
+        (
+            Some(smol::unblock(move || {
+                idle::run(ac_timeout, battery_timeout, idle_tx)
+            })),
+            Some(idle_rx),
+        )
+    } else {
+        (None, None)
+    };
+
     let (control_tx, control_rx) = channel::unbounded();
     let control_status = status.clone();
     let control_task = smol::spawn(async move {
@@ -142,9 +167,11 @@ async fn main() {
         registration_tx,
         control_rx,
         status,
+        idle_config.zip(idle_rx),
     );
     runtime.run().await;
     drop(control_task);
     drop(als_task);
+    drop(idle_task);
     drop(webcam_task);
 }

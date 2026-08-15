@@ -122,6 +122,12 @@ impl fmt::Debug for VulkanDevice {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BacklightKind {
+    Display,
+    Keyboard,
+}
+
 #[derive(Clone, PartialEq)]
 pub struct BacklightOutput {
     pub name: String,
@@ -129,6 +135,7 @@ pub struct BacklightOutput {
     pub capturer: Capturer,
     pub vulkan_device: VulkanDevice,
     pub min_brightness: u64,
+    pub kind: BacklightKind,
     pub predictor: Predictor,
     pub als_direction: crate::predictor::AlsDirection,
 }
@@ -141,6 +148,7 @@ impl fmt::Debug for BacklightOutput {
             .field("capturer", &self.capturer)
             .field("vulkan_device", &self.vulkan_device)
             .field("min_brightness", &self.min_brightness)
+            .field("kind", &self.kind)
             .field("predictor", &self.predictor)
             .finish()
     }
@@ -163,9 +171,23 @@ pub enum Output {
     DdcUtil(DdcUtilOutput),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdleProfile {
+    pub enabled: bool,
+    pub timeout: u64,
+    pub brightness: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Idle {
+    pub ac: IdleProfile,
+    pub battery: IdleProfile,
+}
+
 #[derive(Debug)]
 pub struct Config {
     pub als: Als,
+    pub idle: Option<Idle>,
     pub output: Vec<Output>,
 }
 

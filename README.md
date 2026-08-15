@@ -104,6 +104,31 @@ levels = { 0 = 0, 7 = 10, 9 = 40, 12 = 70, 16 = 50, 19 = 10, 21 = 0 }
 
 The adaptive predictor stores numeric ALS readings and continuously interpolates between nearby learned conditions. IIO lux is mapped to a logarithmic coordinate, while webcam and synthetic time values are linear.
 
+### Idle dimming
+
+After two minutes of inactivity, wluma pauses automatic adjustment, dims displays to 30% of their current brightness and turns keyboard backlights off. These defaults can be changed globally or per power source:
+
+```toml
+[idle]
+enabled = true
+timeout = 120
+brightness = 30
+
+[idle.ac]
+timeout = 300
+
+[idle.battery]
+brightness = 20
+```
+
+Timeouts are in seconds. Omitted AC and battery settings inherit the global values; set `enabled = false` globally or in either profile to disable it. Wluma uses UPower to detect the current power source. When activity resumes, automatic adjustment continues with a fresh prediction rather than explicitly restoring the previous brightness.
+
+Idle detection uses `ext-idle-notify-v1`, which honors compositor idle inhibitors, with GNOME Mutter's IdleMonitor as a fallback. Disable other automatic idle dimming to avoid conflicts. On GNOME:
+
+```sh
+gsettings set org.gnome.settings-daemon.plugins.power idle-dim false
+```
+
 ### Displays
 
 The entire `output` section is optional. Wluma continuously discovers connected DRM outputs, associates internal panels with `/sys/class/backlight` devices and external monitors with DDC using their EDID, and automatically selects a screen capturer. Automatically discovered outputs and keyboards are started and stopped as they appear and disappear. DDC is known to often be problematic, so always consider trying [ddcci-driver-linux](https://gitlab.com/ddcci-driver-linux/ddcci-driver-linux) first if you can.

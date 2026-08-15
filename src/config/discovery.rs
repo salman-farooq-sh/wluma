@@ -63,6 +63,7 @@ pub fn outputs() -> Vec<app::Output> {
                 capturer: app::Capturer::Auto,
                 vulkan_device: app::VulkanDevice::Auto,
                 min_brightness: 1,
+                kind: app::BacklightKind::Display,
                 predictor: app::Predictor::Adaptive,
                 als_direction: crate::predictor::AlsDirection::Increasing,
             }));
@@ -137,6 +138,7 @@ fn keyboards() -> Vec<app::Output> {
                 capturer: app::Capturer::None,
                 vulkan_device: app::VulkanDevice::Auto,
                 min_brightness: 0,
+                kind: app::BacklightKind::Keyboard,
                 predictor: app::Predictor::Adaptive,
                 als_direction: crate::predictor::AlsDirection::Decreasing,
             }))
@@ -329,9 +331,19 @@ mod tests {
             capturer,
             vulkan_device: app::VulkanDevice::Auto,
             min_brightness: 1,
+            kind: app::BacklightKind::Display,
             predictor: app::Predictor::Adaptive,
             als_direction: crate::predictor::AlsDirection::Increasing,
         })
+    }
+
+    fn keyboard(name: &str, path: &str) -> app::Output {
+        let mut output = backlight(name, path, app::Capturer::None);
+        let app::Output::Backlight(backlight) = &mut output else {
+            unreachable!()
+        };
+        backlight.kind = app::BacklightKind::Keyboard;
+        output
     }
 
     #[test]
@@ -356,21 +368,22 @@ mod tests {
 
     #[test]
     fn configured_keyboard_replaces_detected_keyboard_by_path() {
-        let configured = backlight(
+        let configured = keyboard(
             "keyboard-dell",
-            "/sys/class/leds/dell::kbd_backlight",
-            app::Capturer::None,
+            "/sys/bus/platform/devices/dell-laptop/leds/dell::kbd_backlight",
         );
-        let detected = backlight(
+        let detected = keyboard(
             "dell::kbd_backlight",
-            "/sys/class/leds/dell::kbd_backlight",
-            app::Capturer::None,
+            "/sys/bus/platform/devices/dell-laptop/leds/dell::kbd_backlight",
         );
         let merged = merge(vec![configured], vec![detected]);
 
         assert_eq!(merged.len(), 1);
         match &merged[0] {
-            app::Output::Backlight(output) => assert_eq!(output.name, "keyboard-dell"),
+            app::Output::Backlight(output) => {
+                assert_eq!(output.name, "keyboard-dell");
+                assert_eq!(output.kind, app::BacklightKind::Keyboard);
+            }
             _ => unreachable!(),
         }
     }

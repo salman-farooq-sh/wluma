@@ -209,6 +209,7 @@ fn parse_config_str(file_config: &str) -> Result<app::Config> {
                 name: o.name,
                 path: o.path.unwrap_or_default(),
                 min_brightness: 1,
+                kind: app::BacklightKind::Display,
                 capturer: match_capturer(o.capturer.unwrap_or_default()),
                 vulkan_device: o.vulkan_device.into(),
                 predictor: match_predictor(o.predictor.unwrap_or_default())?,
@@ -241,6 +242,7 @@ fn parse_config_str(file_config: &str) -> Result<app::Config> {
             name: k.name,
             path: k.path,
             min_brightness: 0,
+            kind: app::BacklightKind::Keyboard,
             capturer: Capturer::None,
             vulkan_device: app::VulkanDevice::Auto,
             predictor: app::Predictor::Adaptive,
@@ -334,8 +336,32 @@ fn parse_config_str(file_config: &str) -> Result<app::Config> {
         Some(file::Als::None) => app::Als::None,
     };
 
+    let idle = file_config.idle.unwrap_or_default();
+    let defaults = (idle.enabled, idle.timeout, idle.brightness);
+    let profile = |override_: file::IdleProfile| app::IdleProfile {
+        enabled: override_.enabled.unwrap_or(defaults.0),
+        timeout: override_.timeout.unwrap_or(defaults.1),
+        brightness: override_.brightness.unwrap_or(defaults.2),
+    };
+    let ac = profile(idle.ac);
+    let battery = profile(idle.battery);
+    for profile in [ac, battery].into_iter().filter(|profile| profile.enabled) {
+        if profile.timeout == 0 {
+            return Err(anyhow!("Idle timeouts must be greater than zero"));
+        }
+        if profile.brightness > 100 {
+            return Err(anyhow!("Idle brightness must be between 0 and 100"));
+        }
+        profile
+            .timeout
+            .checked_mul(1000)
+            .filter(|timeout| *timeout <= u32::MAX as u64)
+            .ok_or_else(|| anyhow!("Idle timeout is too large"))?;
+    }
+    let idle = (ac.enabled || battery.enabled).then_some(app::Idle { ac, battery });
+
     validate_manual_points(&als, &output)?;
-    Ok(app::Config { als, output })
+    Ok(app::Config { als, idle, output })
 }
 
 fn validate(config: app::Config) -> Result<app::Config> {
@@ -366,6 +392,21 @@ mod tests {
         assert!(!debug.contains("thresholds"));
         assert!(!debug.contains("\"night\""));
         assert!(matches!(config.als, app::Als::Auto { .. }));
+        assert_eq!(
+            config.idle,
+            Some(app::Idle {
+                ac: app::IdleProfile {
+                    enabled: true,
+                    timeout: 120,
+                    brightness: 30
+                },
+                battery: app::IdleProfile {
+                    enabled: true,
+                    timeout: 120,
+                    brightness: 30
+                }
+            })
+        );
     }
 
     #[test]
@@ -380,10 +421,13 @@ path = "/sys/class/leds/kbd_backlight"
         .unwrap();
 
         match &config.output[0] {
-            app::Output::Backlight(output) => assert_eq!(
-                output.als_direction,
-                crate::predictor::AlsDirection::Decreasing
-            ),
+            app::Output::Backlight(output) => {
+                assert_eq!(output.kind, app::BacklightKind::Keyboard);
+                assert_eq!(
+                    output.als_direction,
+                    crate::predictor::AlsDirection::Decreasing
+                );
+            }
             _ => unreachable!(),
         }
         assert!(!format!("{config:#?}").contains("als_direction"));
@@ -583,6 +627,149 @@ reduction = 20
         )
         .unwrap_err();
         assert!(error.to_string().contains("between 0 and 100"));
+    }
+
+    #[test]
+    fn test_idle_configuration() {
+        let config = parse_config_str(
+            r#"
+[idle.ac]
+timeout = 600
+brightness = 40
+
+[idle.battery]
+timeout = 180
+brightness = 20
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.idle,
+            Some(app::Idle {
+                ac: app::IdleProfile {
+                    enabled: true,
+                    timeout: 600,
+                    brightness: 40
+                },
+                battery: app::IdleProfile {
+                    enabled: true,
+                    timeout: 180,
+                    brightness: 20
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn test_idle_profiles_inherit_global_configuration() {
+        let config = parse_config_str(
+            r#"
+[idle]
+timeout = 180
+brightness = 40
+"#,
+        )
+        .unwrap();
+        let idle = config.idle.unwrap();
+        for profile in [idle.ac, idle.battery] {
+            assert!(profile.enabled);
+            assert_eq!(profile.timeout, 180);
+            assert_eq!(profile.brightness, 40);
+        }
+    }
+
+    #[test]
+    fn test_idle_profile_uses_source_defaults() {
+        let config = parse_config_str(
+            r#"
+[idle.battery]
+brightness = 20
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.idle,
+            Some(app::Idle {
+                ac: app::IdleProfile {
+                    enabled: true,
+                    timeout: 120,
+                    brightness: 30
+                },
+                battery: app::IdleProfile {
+                    enabled: true,
+                    timeout: 120,
+                    brightness: 20
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn test_idle_source_can_be_disabled() {
+        let config = parse_config_str(
+            r#"
+[idle.ac]
+enabled = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.idle,
+            Some(app::Idle {
+                ac: app::IdleProfile {
+                    enabled: false,
+                    timeout: 120,
+                    brightness: 30
+                },
+                battery: app::IdleProfile {
+                    enabled: true,
+                    timeout: 120,
+                    brightness: 30
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn test_idle_source_can_override_global_disable() {
+        let config = parse_config_str(
+            r#"
+[idle]
+enabled = false
+
+[idle.battery]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let idle = config.idle.unwrap();
+        assert!(!idle.ac.enabled);
+        assert!(idle.battery.enabled);
+    }
+
+    #[test]
+    fn test_idle_can_be_disabled() {
+        let config = parse_config_str(
+            r#"
+[idle]
+enabled = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.idle, None);
+    }
+
+    #[test]
+    fn test_idle_configuration_is_validated() {
+        for value in [
+            "[idle.ac]\ntimeout = 0",
+            "[idle.battery]\ntimeout = 0",
+            "[idle.ac]\nbrightness = 101",
+            "[idle.battery]\nbrightness = 101",
+            "[idle.ac]\ntimeout = 4294968",
+        ] {
+            assert!(parse_config_str(value).is_err());
+        }
     }
 
     #[test]

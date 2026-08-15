@@ -45,6 +45,7 @@ pub struct Hub(Arc<Mutex<State>>);
 #[derive(Clone)]
 struct State {
     als: AlsStatus,
+    idle: IdleStatus,
     screens: BTreeMap<String, ScreenStatus>,
     monitors: BTreeMap<String, MonitorStatus>,
     watchers: Vec<Sender<Snapshot>>,
@@ -57,6 +58,15 @@ struct AlsStatus {
 }
 
 #[derive(Clone, PartialEq)]
+struct IdleStatus {
+    source: Option<String>,
+    enabled: bool,
+    timeout: Option<u64>,
+    brightness: Option<u8>,
+    idled: bool,
+}
+
+#[derive(Clone, PartialEq)]
 struct ScreenStatus {
     capturer: String,
     luma: Option<u8>,
@@ -66,12 +76,14 @@ struct ScreenStatus {
 struct MonitorStatus {
     kind: String,
     brightness: Option<u8>,
-    paused: bool,
+    manual_pause: bool,
+    idle_pause: bool,
 }
 
 #[derive(Clone, PartialEq)]
 struct Snapshot {
     als: AlsStatus,
+    idle: IdleStatus,
     screens: BTreeMap<String, ScreenStatus>,
     monitors: BTreeMap<String, MonitorStatus>,
 }
@@ -82,6 +94,13 @@ impl Hub {
             als: AlsStatus {
                 kind: als_kind.into(),
                 value: None,
+            },
+            idle: IdleStatus {
+                source: None,
+                enabled: false,
+                timeout: None,
+                brightness: None,
+                idled: false,
             },
             screens: BTreeMap::new(),
             monitors: BTreeMap::new(),
@@ -103,7 +122,8 @@ impl Hub {
                 MonitorStatus {
                     kind: kind.to_string(),
                     brightness: None,
-                    paused: false,
+                    manual_pause: false,
+                    idle_pause: false,
                 },
             );
             if let Some(capturer) = capturer {
@@ -149,12 +169,26 @@ impl Hub {
         });
     }
 
-    pub fn set_paused(&self, name: &str, paused: bool) {
+    pub fn set_pause(&self, name: &str, manual: bool, idle: bool) {
         self.change(|state| {
             if let Some(monitor) = state.monitors.get_mut(name) {
-                monitor.paused = paused;
+                monitor.manual_pause = manual;
+                monitor.idle_pause = idle;
             }
         });
+    }
+
+    pub fn set_idle_profile(&self, source: &str, enabled: bool, timeout: u64, brightness: u8) {
+        self.change(|state| {
+            state.idle.source = Some(source.to_string());
+            state.idle.enabled = enabled;
+            state.idle.timeout = Some(timeout);
+            state.idle.brightness = Some(brightness);
+        });
+    }
+
+    pub fn set_idled(&self, idled: bool) {
+        self.change(|state| state.idle.idled = idled);
     }
 
     fn change(&self, update: impl FnOnce(&mut State)) {
@@ -186,6 +220,7 @@ impl State {
     fn snapshot(&self) -> Snapshot {
         Snapshot {
             als: self.als.clone(),
+            idle: self.idle.clone(),
             screens: self.screens.clone(),
             monitors: self.monitors.clone(),
         }
@@ -458,6 +493,33 @@ async fn write_request(socket: &mut UnixStream, request: &str) -> Result<()> {
     Ok(())
 }
 
+impl IdleStatus {
+    fn state(&self) -> &str {
+        if !self.enabled {
+            "disabled"
+        } else if self.idled {
+            "idle"
+        } else {
+            "active"
+        }
+    }
+}
+
+impl MonitorStatus {
+    fn state(&self) -> &str {
+        match (self.manual_pause, self.idle_pause) {
+            (false, false) => "active",
+            (true, false) => "manual",
+            (false, true) => "idle",
+            (true, true) => "idle+manual",
+        }
+    }
+
+    fn paused(&self) -> bool {
+        self.manual_pause || self.idle_pause
+    }
+}
+
 impl Snapshot {
     fn tables(&self) -> String {
         let als_width = "ALS TYPE".len().max(self.als.kind.len());
@@ -470,6 +532,26 @@ impl Snapshot {
             ),
             String::new(),
         ];
+        let idle_headers = [
+            "POWER SOURCE",
+            "IDLE STATE",
+            "ENABLED",
+            "TIMEOUT",
+            "BRIGHTNESS",
+        ];
+        let idle_row = [
+            self.idle.source.as_deref().unwrap_or("-").to_string(),
+            self.idle.state().to_string(),
+            if self.idle.enabled { "yes" } else { "no" }.to_string(),
+            optional(self.idle.timeout, "s"),
+            optional(self.idle.brightness, "%"),
+        ];
+        let idle_widths = std::array::from_fn::<_, 5, _>(|column| {
+            idle_headers[column].len().max(idle_row[column].len())
+        });
+        lines.push(format_row(&idle_headers, &idle_widths));
+        lines.push(format_row(&idle_row, &idle_widths));
+        lines.push(String::new());
         let headers = ["OUTPUT", "TYPE", "CAPTURER", "LUMA", "BRIGHTNESS", "STATE"];
         let rows = self
             .monitors
@@ -482,7 +564,7 @@ impl Snapshot {
                     screen.map_or_else(|| "-".to_string(), |screen| screen.capturer.clone()),
                     optional(screen.and_then(|screen| screen.luma), "%"),
                     optional(monitor.brightness, "%"),
-                    if monitor.paused { "paused" } else { "active" }.to_string(),
+                    monitor.state().to_string(),
                 ]
             })
             .collect::<Vec<_>>();
@@ -499,14 +581,23 @@ impl Snapshot {
     }
 
     fn line(&self) -> String {
-        let mut parts = vec![format!("als={}", optional(self.als.value, ""))];
+        let mut parts = vec![
+            format!("als={}", optional(self.als.value, "")),
+            format!(
+                "power={},idle={},idle-timeout={},idle-brightness={}",
+                self.idle.source.as_deref().unwrap_or("-"),
+                self.idle.state(),
+                optional(self.idle.timeout, "s"),
+                optional(self.idle.brightness, "%")
+            ),
+        ];
         for (name, monitor) in &self.monitors {
             let luma = self.screens.get(name).and_then(|screen| screen.luma);
             parts.push(format!(
                 "{name}:luma={},brightness={},{}",
                 optional(luma, "%"),
                 optional(monitor.brightness, "%"),
-                if monitor.paused { "paused" } else { "active" }
+                monitor.state()
             ));
         }
         parts.join(" ")
@@ -519,21 +610,28 @@ impl Snapshot {
             .map(|(name, monitor)| {
                 let screen = self.screens.get(name);
                 format!(
-                    "{{\"name\":{},\"type\":{},\"capturer\":{},\"luma\":{},\"brightness\":{},\"paused\":{}}}",
+                    "{{\"name\":{},\"type\":{},\"capturer\":{},\"luma\":{},\"brightness\":{},\"state\":{},\"paused\":{},\"idle\":{}}}",
                     json_string(name),
                     json_string(&monitor.kind),
                     screen.map_or_else(|| "null".to_string(), |screen| json_string(&screen.capturer)),
                     json_option(screen.and_then(|screen| screen.luma)),
                     json_option(monitor.brightness),
-                    monitor.paused
+                    json_string(monitor.state()),
+                    monitor.paused(),
+                    monitor.idle_pause
                 )
             })
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{{\"als\":{{\"type\":{},\"value\":{}}},\"outputs\":[{}]}}",
+            "{{\"als\":{{\"type\":{},\"value\":{}}},\"idle\":{{\"power_source\":{},\"state\":{},\"enabled\":{},\"timeout\":{},\"brightness\":{}}},\"outputs\":[{}]}}",
             json_string(&self.als.kind),
             json_option(self.als.value),
+            self.idle.source.as_ref().map_or_else(|| "null".to_string(), |source| json_string(source)),
+            json_string(self.idle.state()),
+            self.idle.enabled,
+            json_option(self.idle.timeout),
+            json_option(self.idle.brightness),
             outputs
         )
     }
@@ -607,12 +705,30 @@ mod tests {
     }
 
     #[test]
+    fn reports_idle_status_and_pause_reasons_as_json() {
+        let hub = Hub::new("none");
+        hub.set_idle_profile("battery", true, 120, 20);
+        hub.set_idled(true);
+        hub.add_output("eDP-1", "backlight", Some("wayland"));
+        hub.set_pause("eDP-1", true, true);
+
+        let json = hub.snapshot().json();
+        assert!(json.contains(
+            "\"idle\":{\"power_source\":\"battery\",\"state\":\"idle\",\"enabled\":true,\"timeout\":120,\"brightness\":20}"
+        ));
+        assert!(json.contains("\"state\":\"idle+manual\",\"paused\":true,\"idle\":true"));
+    }
+
+    #[test]
     fn aligns_status_columns_for_long_output_names() {
         let hub = Hub::new("iio-sensor-proxy");
         hub.set_als("iio-sensor-proxy", 925);
+        hub.set_idle_profile("battery", true, 120, 30);
+        hub.set_idled(true);
         hub.add_output("DP-1", "ddc", Some("wayland"));
         hub.set_luma("DP-1", 16);
         hub.set_brightness("DP-1", 99);
+        hub.set_pause("DP-1", false, true);
         hub.add_output("dell::kbd_backlight", "backlight", None);
         hub.set_brightness("dell::kbd_backlight", 0);
 
@@ -621,8 +737,11 @@ mod tests {
             "ALS TYPE          VALUE\n\
              iio-sensor-proxy  925\n\
              \n\
+             POWER SOURCE  IDLE STATE  ENABLED  TIMEOUT  BRIGHTNESS\n\
+             battery       idle        yes      120s     30%\n\
+             \n\
              OUTPUT               TYPE       CAPTURER  LUMA  BRIGHTNESS  STATE\n\
-             DP-1                 ddc        wayland   16%   99%         active\n\
+             DP-1                 ddc        wayland   16%   99%         idle\n\
              dell::kbd_backlight  backlight  -         -     0%          active"
         );
     }

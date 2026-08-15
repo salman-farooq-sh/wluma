@@ -1,4 +1,4 @@
-use crate::{als, brightness, config, frame, predictor};
+use crate::{als, brightness, config, frame, idle, predictor};
 use anyhow::Result;
 use smol::channel::{self, Receiver, Sender};
 use smol::Task;
@@ -25,6 +25,9 @@ pub struct Runtime {
     settling_until: Option<Instant>,
     commands: Receiver<crate::control::Command>,
     status: crate::control::Hub,
+    idle: Option<config::Idle>,
+    idle_events: Option<Receiver<idle::Event>>,
+    idle_brightness: Option<u8>,
 }
 
 struct Session {
@@ -43,7 +46,11 @@ impl Runtime {
         registrations: Sender<Sender<als::Reading>>,
         commands: Receiver<crate::control::Command>,
         status: crate::control::Hub,
+        idle: Option<(config::Idle, Receiver<idle::Event>)>,
     ) -> Self {
+        let (idle, idle_events) = idle.map_or((None, None), |(config, events)| {
+            (Some(config), Some(events))
+        });
         Self {
             configured,
             als_scale,
@@ -57,12 +64,16 @@ impl Runtime {
             settling_until: None,
             commands,
             status,
+            idle,
+            idle_events,
+            idle_brightness: None,
         }
     }
 
     pub async fn run(&mut self) {
         enum Event {
             Command(Result<crate::control::Command, smol::channel::RecvError>),
+            Idle(Result<idle::Event, smol::channel::RecvError>),
             Tick,
         }
 
@@ -70,17 +81,83 @@ impl Runtime {
         loop {
             let event = smol::future::race(
                 async { Event::Command(self.commands.recv().await) },
-                async {
-                    smol::Timer::after(TOPOLOGY_POLL_INTERVAL).await;
-                    Event::Tick
-                },
+                smol::future::race(
+                    async {
+                        smol::Timer::after(TOPOLOGY_POLL_INTERVAL).await;
+                        Event::Tick
+                    },
+                    async {
+                        match &self.idle_events {
+                            Some(events) => Event::Idle(events.recv().await),
+                            None => std::future::pending().await,
+                        }
+                    },
+                ),
             )
             .await;
             match event {
                 Event::Command(Ok(command)) => self.command(command).await,
                 Event::Command(Err(_)) => return,
+                Event::Idle(Ok(event)) => self.idle_event(event).await,
+                Event::Idle(Err(_)) => self.idle_events = None,
                 Event::Tick => self.step().await,
             }
+        }
+    }
+
+    async fn idle_event(&mut self, event: idle::Event) {
+        let result = match event {
+            idle::Event::PowerSourceChanged(source) => {
+                let idle = self
+                    .idle
+                    .expect("Power source event received without idle configuration");
+                let (name, profile) = match source {
+                    idle::PowerSource::Ac => ("ac", idle.ac),
+                    idle::PowerSource::Battery => ("battery", idle.battery),
+                };
+                self.status.set_idle_profile(
+                    name,
+                    profile.enabled,
+                    profile.timeout,
+                    profile.brightness,
+                );
+                return;
+            }
+            idle::Event::Idled(source) => {
+                if self.idle_brightness.is_some() {
+                    return;
+                }
+                let idle = self
+                    .idle
+                    .expect("Idle event received without configuration");
+                let percent = match source {
+                    idle::PowerSource::Ac => idle.ac.brightness,
+                    idle::PowerSource::Battery => idle.battery.brightness,
+                };
+                self.idle_brightness = Some(percent);
+                self.status.set_idled(true);
+                log::debug!("User became idle on {source:?}");
+                self.all_output_commands(|session| {
+                    brightness::CommandAction::IdleEnter(if is_keyboard(&session.output) {
+                        0
+                    } else {
+                        percent
+                    })
+                })
+                .await
+            }
+            idle::Event::Resumed => {
+                if self.idle_brightness.take().is_none() {
+                    return;
+                }
+                self.status.set_idled(false);
+                log::debug!("User became active");
+                self.output_commands(None, || brightness::CommandAction::IdleLeave)
+                    .await
+            }
+        };
+        if let Err(error) = result {
+            log::warn!("Unable to update idle brightness: {error}");
         }
     }
 
@@ -134,9 +211,16 @@ impl Runtime {
             self.output_command(name, action()).await?;
             return Ok(());
         }
+        self.all_output_commands(|_| action()).await
+    }
+
+    async fn all_output_commands(
+        &self,
+        action: impl Fn(&Session) -> brightness::CommandAction,
+    ) -> std::result::Result<(), String> {
         let mut failures = Vec::new();
         for (name, session) in &self.sessions {
-            if let Err(error) = send_command(&session.commands, action()).await {
+            if let Err(error) = send_command(&session.commands, action(session)).await {
                 failures.push(format!("{name}: {error}"));
             }
         }
@@ -264,8 +348,18 @@ impl Runtime {
             {
                 Ok(session) => {
                     log::info!("Started using output '{name}'");
+                    let keyboard = is_keyboard(&session.output);
                     self.sessions.insert(name.clone(), session);
                     self.failures.remove(&name);
+                    if let Some(percent) = self.idle_brightness {
+                        let percent = if keyboard { 0 } else { percent };
+                        if let Err(error) = self
+                            .output_command(&name, brightness::CommandAction::IdleEnter(percent))
+                            .await
+                        {
+                            log::warn!("Unable to update idle brightness for '{name}': {error}");
+                        }
+                    }
                 }
                 Err(error) => {
                     log::warn!("Unable to initialize output '{name}': {error:#}");
@@ -323,7 +417,7 @@ impl Session {
             }
         };
 
-        let keyboard = matches!(&output, config::Output::Backlight(output) if output.path.contains("/class/leds/"));
+        let keyboard = is_keyboard(&output);
         let kind = match &output {
             config::Output::Backlight(_) => "backlight",
             config::Output::DdcUtil(_) => "ddc",
@@ -444,13 +538,19 @@ fn output_name(output: &config::Output) -> &str {
     }
 }
 
+fn is_keyboard(output: &config::Output) -> bool {
+    matches!(output, config::Output::Backlight(output) if output.kind == config::BacklightKind::Keyboard)
+}
+
 fn log_discovered(output: &config::Output) {
     match output {
-        config::Output::Backlight(output) if output.path.contains("/class/leds/") => log::debug!(
-            "Discovered keyboard '{}' using backlight {}",
-            output.name,
-            output.path
-        ),
+        config::Output::Backlight(output) if output.kind == config::BacklightKind::Keyboard => {
+            log::debug!(
+                "Discovered keyboard '{}' using backlight {}",
+                output.name,
+                output.path
+            )
+        }
         config::Output::Backlight(output) => log::debug!(
             "Discovered output '{}' using backlight {}",
             output.name,
