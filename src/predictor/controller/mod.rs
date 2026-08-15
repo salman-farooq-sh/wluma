@@ -1,5 +1,7 @@
 use super::data::Entry;
 use crate::als::Scale;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub mod adaptive;
@@ -35,16 +37,59 @@ impl Cooldown {
 }
 
 #[allow(clippy::large_enum_variant)]
-pub enum Controller {
+enum Inner {
     Adaptive(adaptive::Controller),
     Manual(manual::Controller),
 }
 
+pub struct Controller {
+    inner: Inner,
+    status: Option<(crate::control::Hub, String)>,
+    paused: Option<Arc<AtomicBool>>,
+}
+
 impl Controller {
+    pub fn adaptive(controller: adaptive::Controller) -> Self {
+        Self {
+            inner: Inner::Adaptive(controller),
+            status: None,
+            paused: None,
+        }
+    }
+
+    pub fn manual(controller: manual::Controller) -> Self {
+        Self {
+            inner: Inner::Manual(controller),
+            status: None,
+            paused: None,
+        }
+    }
+
+    pub fn with_status(
+        mut self,
+        status: crate::control::Hub,
+        output: String,
+        paused: Arc<AtomicBool>,
+    ) -> Self {
+        self.status = Some((status, output));
+        self.paused = Some(paused);
+        self
+    }
+
     pub async fn adjust(&mut self, luma: u8) {
-        match self {
-            Self::Adaptive(c) => c.adjust(luma).await,
-            Self::Manual(c) => c.adjust(luma).await,
+        if self
+            .paused
+            .as_ref()
+            .is_some_and(|paused| paused.load(Ordering::Relaxed))
+        {
+            return;
+        }
+        if let Some((status, output)) = &self.status {
+            status.set_luma(output, luma);
+        }
+        match &mut self.inner {
+            Inner::Adaptive(c) => c.adjust(luma).await,
+            Inner::Manual(c) => c.adjust(luma).await,
         }
     }
 }

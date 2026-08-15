@@ -87,7 +87,7 @@ impl Als {
     pub fn backend_name(&self) -> &'static str {
         match &self.source {
             Source::SensorProxy(_) => "iio-sensor-proxy",
-            Source::Sysfs(_) => "sysfs",
+            Source::Sysfs(_) => "iio-sysfs",
         }
     }
 

@@ -4,7 +4,9 @@ use smol::channel;
 mod als;
 mod brightness;
 mod channel_ext;
+mod cli;
 mod config;
+mod control;
 mod device_file;
 mod frame;
 mod predictor;
@@ -16,6 +18,25 @@ pub const VERSION: &str = env!("WLUMA_VERSION");
 
 #[apply(smol_macros::main!)]
 async fn main() {
+    match cli::parse() {
+        Ok(cli::Mode::Daemon) => {}
+        Ok(cli::Mode::Command { request, stream }) => {
+            if let Err(error) = control::send(&request, stream).await {
+                eprintln!("wluma: {error:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Ok(cli::Mode::Print(value)) => {
+            println!("{value}");
+            return;
+        }
+        Err(error) => {
+            eprintln!("wluma: {error}");
+            std::process::exit(2);
+        }
+    }
+
     let panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         panic_hook(panic_info);
@@ -28,6 +49,9 @@ async fn main() {
         .init();
 
     log::debug!("== wluma v{} ==", VERSION);
+
+    let _instance_lock = control::InstanceLock::acquire()
+        .unwrap_or_else(|error| panic!("Unable to acquire daemon lock: {error:#}"));
 
     match state::migrate() {
         Ok(true) => log::info!(
@@ -43,6 +67,16 @@ async fn main() {
     };
 
     log::debug!("Using {:#?}", config);
+
+    let als_kind = match &config.als {
+        config::Als::Auto { .. } => "auto",
+        config::Als::External { .. } => "external",
+        config::Als::Iio { .. } => "iio",
+        config::Als::Time { .. } => "time",
+        config::Als::Webcam { .. } => "webcam",
+        config::Als::None => "none",
+    };
+    let status = control::Hub::new(als_kind);
 
     let (als_scale, legacy_thresholds) = match &config.als {
         config::Als::Auto { thresholds } | config::Als::Iio { thresholds, .. } => {
@@ -83,17 +117,34 @@ async fn main() {
     };
 
     let (registration_tx, registration_rx) = channel::unbounded();
+    let als_status = status.clone();
     let als_task = smol::spawn(async move {
         als::controller::Controller::new(source, registration_rx)
+            .with_status(als_status)
             .run()
             .await;
     });
 
+    let (control_tx, control_rx) = channel::unbounded();
+    let control_status = status.clone();
+    let control_task = smol::spawn(async move {
+        if let Err(error) = control::serve(control_status, control_tx).await {
+            panic!("Unable to start control socket: {error:#}");
+        }
+    });
+
     log::info!("Continue adjusting brightness and wluma will learn your preference over time.");
 
-    let mut runtime =
-        runtime::Runtime::new(config.output, als_scale, legacy_thresholds, registration_tx);
+    let mut runtime = runtime::Runtime::new(
+        config.output,
+        als_scale,
+        legacy_thresholds,
+        registration_tx,
+        control_rx,
+        status,
+    );
     runtime.run().await;
+    drop(control_task);
     drop(als_task);
     drop(webcam_task);
 }

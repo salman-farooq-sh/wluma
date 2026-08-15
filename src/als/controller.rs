@@ -124,6 +124,7 @@ pub struct Controller {
     last_observation: Option<Instant>,
     last_reading: Option<Reading>,
     generation: u64,
+    status: Option<crate::control::Hub>,
 }
 
 impl Controller {
@@ -138,7 +139,13 @@ impl Controller {
             last_observation: None,
             last_reading: None,
             generation,
+            status: None,
         }
+    }
+
+    pub fn with_status(mut self, status: crate::control::Hub) -> Self {
+        self.status = Some(status);
+        self
     }
 
     pub async fn run(&mut self) {
@@ -152,6 +159,9 @@ impl Controller {
         let started = Instant::now();
         match self.als.get().await {
             Ok(Some(value)) => {
+                if let Some(status) = &self.status {
+                    status.set_als(self.als.kind().await, value);
+                }
                 let generation = self.als.generation();
                 if generation != self.generation {
                     self.generation = generation;

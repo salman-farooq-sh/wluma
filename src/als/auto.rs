@@ -115,6 +115,14 @@ impl Als {
         Ok(Some(0))
     }
 
+    pub async fn kind(&self) -> &'static str {
+        match &self.state.lock().await.source {
+            Source::External(_) => "external",
+            Source::Iio(source) => source.backend_name(),
+            Source::None => "none",
+        }
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
     }

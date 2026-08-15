@@ -32,6 +32,8 @@ Simply launch `wluma` and continue adjusting your screen brightness as you usual
 
 `wluma` will not do anything on the first launch! You have to adjust the brightness by hand a few times, in different environment and/or with different screen contents, that way `wluma` will learn your preferences and only then it will begin to automatically change your screen brightness for you.
 
+Changing brightness, seeing status and controlling the running daemon can be also done through CLI commands, run `wluma help` to see all available options.
+
 ## Performance
 
 The app has minimal impact on system resources and battery life even though it is able to monitor screen contents several times a second. This is achieved by importing DMA-BUF screen buffers and doing computations on GPU using Vulkan API.

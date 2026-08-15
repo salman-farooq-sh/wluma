@@ -1,6 +1,6 @@
 use crate::{als, brightness, config, frame, predictor};
 use anyhow::Result;
-use smol::channel::{self, Sender};
+use smol::channel::{self, Receiver, Sender};
 use smol::Task;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +23,8 @@ pub struct Runtime {
     failures: HashMap<String, Instant>,
     last_discovery: Option<Instant>,
     settling_until: Option<Instant>,
+    commands: Receiver<crate::control::Command>,
+    status: crate::control::Hub,
 }
 
 struct Session {
@@ -30,6 +32,7 @@ struct Session {
     active: Arc<AtomicBool>,
     brightness: Task<()>,
     capturer: Task<()>,
+    commands: Sender<brightness::Command>,
 }
 
 impl Runtime {
@@ -38,6 +41,8 @@ impl Runtime {
         als_scale: als::Scale,
         legacy_thresholds: HashMap<u64, String>,
         registrations: Sender<Sender<als::Reading>>,
+        commands: Receiver<crate::control::Command>,
+        status: crate::control::Hub,
     ) -> Self {
         Self {
             configured,
@@ -50,14 +55,109 @@ impl Runtime {
             failures: HashMap::new(),
             last_discovery: None,
             settling_until: None,
+            commands,
+            status,
         }
     }
 
     pub async fn run(&mut self) {
-        loop {
-            self.step().await;
-            smol::Timer::after(TOPOLOGY_POLL_INTERVAL).await;
+        enum Event {
+            Command(Result<crate::control::Command, smol::channel::RecvError>),
+            Tick,
         }
+
+        self.step().await;
+        loop {
+            let event = smol::future::race(
+                async { Event::Command(self.commands.recv().await) },
+                async {
+                    smol::Timer::after(TOPOLOGY_POLL_INTERVAL).await;
+                    Event::Tick
+                },
+            )
+            .await;
+            match event {
+                Event::Command(Ok(command)) => self.command(command).await,
+                Event::Command(Err(_)) => return,
+                Event::Tick => self.step().await,
+            }
+        }
+    }
+
+    async fn command(&mut self, command: crate::control::Command) {
+        let result = self.execute(command.action).await;
+        let _ = command.response.send(result).await;
+    }
+
+    async fn execute(
+        &mut self,
+        action: crate::control::Action,
+    ) -> std::result::Result<String, String> {
+        use crate::control::Action;
+        match action {
+            Action::Get(name) => Ok(format!(
+                "{}%",
+                self.output_command(&name, brightness::CommandAction::Get)
+                    .await?
+            )),
+            Action::Set(name, adjustment) => Ok(format!(
+                "{}%",
+                self.output_command(&name, brightness::CommandAction::Set(adjustment))
+                    .await?
+            )),
+            Action::Pause(name, duration) => {
+                self.output_commands(name.as_deref(), || {
+                    brightness::CommandAction::Pause(duration)
+                })
+                .await?;
+                Ok("ok".to_string())
+            }
+            Action::Resume(name) => {
+                self.output_commands(name.as_deref(), || brightness::CommandAction::Resume)
+                    .await?;
+                Ok("ok".to_string())
+            }
+            Action::Toggle(name) => {
+                self.output_commands(name.as_deref(), || brightness::CommandAction::Toggle)
+                    .await?;
+                Ok("ok".to_string())
+            }
+        }
+    }
+
+    async fn output_commands(
+        &self,
+        name: Option<&str>,
+        action: impl Fn() -> brightness::CommandAction,
+    ) -> std::result::Result<(), String> {
+        if let Some(name) = name {
+            self.output_command(name, action()).await?;
+            return Ok(());
+        }
+        let mut failures = Vec::new();
+        for (name, session) in &self.sessions {
+            if let Err(error) = send_command(&session.commands, action()).await {
+                failures.push(format!("{name}: {error}"));
+            }
+        }
+        failures.sort();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("failed for {}", failures.join("; ")))
+        }
+    }
+
+    async fn output_command(
+        &self,
+        name: &str,
+        action: brightness::CommandAction,
+    ) -> std::result::Result<u8, String> {
+        let session = self
+            .sessions
+            .get(name)
+            .ok_or_else(|| format!("unknown or disconnected output '{name}'"))?;
+        send_command(&session.commands, action).await
     }
 
     async fn step(&mut self) {
@@ -119,6 +219,7 @@ impl Runtime {
         for name in stopped {
             if let Some(session) = self.sessions.remove(&name) {
                 session.stop().await;
+                self.status.remove_output(&name);
                 log::warn!("Output '{name}' stopped unexpectedly; it will be retried");
                 self.failures.insert(name, Instant::now());
             }
@@ -133,6 +234,7 @@ impl Runtime {
         for name in removed {
             if let Some(session) = self.sessions.remove(&name) {
                 session.stop().await;
+                self.status.remove_output(&name);
                 log::info!("Stopped using output '{name}'");
             }
             self.failures.remove(&name);
@@ -156,6 +258,7 @@ impl Runtime {
                 self.als_scale,
                 &self.legacy_thresholds,
                 &self.registrations,
+                self.status.clone(),
             )
             .await
             {
@@ -179,10 +282,13 @@ impl Session {
         als_scale: als::Scale,
         legacy_thresholds: &HashMap<u64, String>,
         registrations: &Sender<Sender<als::Reading>>,
+        status: crate::control::Hub,
     ) -> Result<Self> {
         let (als_tx, als_rx) = channel::bounded(1);
         let (user_tx, user_rx) = channel::bounded(128);
         let (prediction_tx, prediction_rx) = channel::bounded(128);
+        let (command_tx, command_rx) = channel::bounded(32);
+        let paused = Arc::new(AtomicBool::new(false));
 
         let (name, capturer, vulkan_device, output_predictor, als_direction) = match &output {
             config::Output::Backlight(output) => (
@@ -217,16 +323,38 @@ impl Session {
             }
         };
 
+        let keyboard = matches!(&output, config::Output::Backlight(output) if output.path.contains("/class/leds/"));
+        let kind = match &output {
+            config::Output::Backlight(_) => "backlight",
+            config::Output::DdcUtil(_) => "ddc",
+        };
+        let capturer_name = match &capturer {
+            config::Capturer::Auto => "auto",
+            config::Capturer::Wayland(_) => "wayland",
+            config::Capturer::Pipewire(_) => "pipewire",
+            config::Capturer::None => "none",
+        };
+        status.add_output(&name, kind, (!keyboard).then_some(capturer_name));
+
         registrations.send(als_tx).await?;
+        let brightness_status = status.clone();
+        let brightness_name = name.clone();
+        let brightness_paused = paused.clone();
         let brightness = smol::spawn(async move {
             brightness::Controller::new(backend, user_tx, prediction_rx)
+                .with_control(
+                    command_rx,
+                    brightness_status,
+                    brightness_name,
+                    brightness_paused,
+                )
                 .run()
                 .await;
         });
 
         let controller = match output_predictor {
             config::Predictor::Manual { points } => {
-                predictor::Controller::Manual(predictor::controller::manual::Controller::new(
+                predictor::Controller::manual(predictor::controller::manual::Controller::new(
                     prediction_tx,
                     user_rx,
                     als_rx,
@@ -238,7 +366,7 @@ impl Session {
                     als_scale,
                 ))
             }
-            config::Predictor::Adaptive => predictor::Controller::Adaptive(
+            config::Predictor::Adaptive => predictor::Controller::adaptive(
                 predictor::controller::adaptive::Controller::new(
                     prediction_tx,
                     user_rx,
@@ -250,7 +378,8 @@ impl Session {
                 )
                 .with_als_direction(als_direction),
             ),
-        };
+        }
+        .with_status(status.clone(), name.clone(), paused);
         let frame_capturer = match capturer {
             config::Capturer::Auto => frame::capturer::Capturer::Auto,
             config::Capturer::Wayland(protocol) => frame::capturer::Capturer::Wayland(
@@ -261,9 +390,16 @@ impl Session {
         };
         let active = Arc::new(AtomicBool::new(true));
         let capture_active = active.clone();
+        let capture_status = status.clone();
         let capturer = smol::spawn(async move {
             frame_capturer
-                .run(&name, controller, vulkan_device.as_deref(), capture_active)
+                .run(
+                    &name,
+                    controller,
+                    vulkan_device.as_deref(),
+                    capture_active,
+                    capture_status,
+                )
                 .await;
         });
 
@@ -272,6 +408,7 @@ impl Session {
             active,
             brightness,
             capturer,
+            commands: command_tx,
         })
     }
 
@@ -280,6 +417,24 @@ impl Session {
         self.brightness.cancel().await;
         self.capturer.await;
     }
+}
+
+async fn send_command(
+    commands: &Sender<brightness::Command>,
+    action: brightness::CommandAction,
+) -> std::result::Result<u8, String> {
+    let (response_tx, response_rx) = channel::bounded(1);
+    commands
+        .send(brightness::Command {
+            action,
+            response: response_tx,
+        })
+        .await
+        .map_err(|_| "output stopped responding".to_string())?;
+    response_rx
+        .recv()
+        .await
+        .map_err(|_| "output stopped responding".to_string())?
 }
 
 fn output_name(output: &config::Output) -> &str {

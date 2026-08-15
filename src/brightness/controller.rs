@@ -4,8 +4,10 @@ use smol::Timer;
 use crate::channel_ext::ReceiverExt;
 
 use super::Brightness;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TRANSITION_MAX_MS: u64 = 200;
 
@@ -15,6 +17,24 @@ pub struct Controller {
     prediction_rx: Receiver<u64>,
     current: Option<u64>,
     target: Option<Target>,
+    commands: Option<Receiver<Command>>,
+    status: Option<(crate::control::Hub, String)>,
+    paused_until: Option<Option<Instant>>,
+    paused: Option<Arc<AtomicBool>>,
+    resuming: bool,
+}
+
+pub struct Command {
+    pub action: CommandAction,
+    pub response: Sender<Result<u8, String>>,
+}
+
+pub enum CommandAction {
+    Get,
+    Set(crate::control::Adjustment),
+    Pause(Option<Duration>),
+    Resume,
+    Toggle,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -37,7 +57,25 @@ impl Controller {
             prediction_rx,
             current: None,
             target: None,
+            commands: None,
+            status: None,
+            paused_until: None,
+            paused: None,
+            resuming: false,
         }
+    }
+
+    pub fn with_control(
+        mut self,
+        commands: Receiver<Command>,
+        status: crate::control::Hub,
+        output: String,
+        paused: Arc<AtomicBool>,
+    ) -> Self {
+        self.commands = Some(commands);
+        self.status = Some((status, output));
+        self.paused = Some(paused);
+        self
     }
 
     pub async fn run(&mut self) {
@@ -47,6 +85,18 @@ impl Controller {
     }
 
     async fn step(&mut self) {
+        self.expire_pause();
+        while let Some(command) = self
+            .commands
+            .as_ref()
+            .and_then(|commands| commands.try_recv().ok())
+        {
+            self.command(command).await;
+        }
+        if self.is_paused() {
+            self.wait().await;
+            return;
+        }
         match self.brightness.get().await {
             Ok(new_brightness) => {
                 let predicted_value = self
@@ -56,12 +106,20 @@ impl Controller {
                     .expect("prediction_rx closed unexpectedly");
 
                 // 1. check if user wants to learn a new value - this overrides any ongoing activity
-                if Some(new_brightness) != self.current {
+                if self.resuming {
+                    self.resuming = false;
+                    self.current = Some(new_brightness);
+                    self.target = None;
+                } else if Some(new_brightness) != self.current {
                     return self.update_current(new_brightness).await;
                 }
 
+                if let Some((status, output)) = &self.status {
+                    status.set_brightness(output, self.brightness.percent(new_brightness));
+                }
+
                 // 2. check if predictor wants to set a new value
-                if let Some(desired) = predicted_value {
+                if let Some(desired) = predicted_value.filter(|_| !self.is_paused()) {
                     self.update_target(desired);
                 }
 
@@ -75,16 +133,174 @@ impl Controller {
 
         // 4. nothing to do, sleep and check again
         // TODO: replace with inotify events on brightness device file and avoid sleep loop
-        Timer::after(Duration::from_millis(self.brightness.waiting_sleep_ms())).await;
+        self.wait().await;
+    }
+
+    async fn wait(&mut self) {
+        let delay = Duration::from_millis(self.brightness.waiting_sleep_ms());
+        if let Some(commands) = self.commands.clone() {
+            let command = smol::future::race(async { commands.recv().await.ok() }, async {
+                Timer::after(delay).await;
+                None
+            })
+            .await;
+            if let Some(command) = command {
+                self.command(command).await;
+            }
+        } else {
+            Timer::after(delay).await;
+        }
     }
 
     async fn update_current(&mut self, new_brightness: u64) {
         self.current = Some(new_brightness);
-        self.user_tx
-            .send(new_brightness)
-            .await
-            .expect("Unable to send new brightness value set by user, channel is dead");
+        if let Some((status, output)) = &self.status {
+            status.set_brightness(output, self.brightness.percent(new_brightness));
+        }
+        if !self.is_paused() {
+            self.user_tx
+                .send(new_brightness)
+                .await
+                .expect("Unable to send new brightness value set by user, channel is dead");
+        }
         self.target = None;
+    }
+
+    async fn command(&mut self, command: Command) {
+        let result = self
+            .execute(command.action)
+            .await
+            .map_err(|error| format!("{error:#}"));
+        let _ = command.response.send(result).await;
+    }
+
+    async fn execute(&mut self, action: CommandAction) -> anyhow::Result<u8> {
+        let mut result = None;
+        match action {
+            CommandAction::Get => {
+                let value = self.brightness.get().await?;
+                if !self.is_paused() && Some(value) != self.current {
+                    self.update_current(value).await;
+                }
+                result = Some(value);
+            }
+            CommandAction::Set(adjustment) => {
+                let current = if self.is_paused() {
+                    self.brightness.get().await?
+                } else if let Some(current) = self.current {
+                    current
+                } else {
+                    let current = self.brightness.get().await?;
+                    self.update_current(current).await;
+                    current
+                };
+                let current_percent = self.brightness.percent(current);
+                let percent = if adjustment.relative {
+                    if adjustment.increase {
+                        current_percent.saturating_add(adjustment.percent).min(100)
+                    } else {
+                        current_percent.saturating_sub(adjustment.percent)
+                    }
+                } else {
+                    adjustment.percent
+                };
+                let value = self.brightness.value_at_percent(percent);
+                let value = self.brightness.set(value).await?;
+                result = Some(value);
+                if !self.is_paused() {
+                    let _ = self.prediction_rx.recv_maybe_last().await?;
+                    self.current = Some(value);
+                    self.target = None;
+                    if let Some((status, output)) = &self.status {
+                        status.set_brightness(output, self.brightness.percent(value));
+                    }
+                    self.user_tx.send(value).await?;
+                }
+            }
+            CommandAction::Pause(duration) => {
+                let deadline = duration
+                    .map(|duration| {
+                        Instant::now()
+                            .checked_add(duration)
+                            .ok_or_else(|| anyhow::anyhow!("pause duration is too large"))
+                    })
+                    .transpose()?;
+                self.set_paused(Some(deadline));
+                match duration {
+                    Some(duration) => log::debug!(
+                        "[{}] Paused automatic brightness adjustment for {}s",
+                        self.output_name(),
+                        duration.as_secs()
+                    ),
+                    None => log::debug!(
+                        "[{}] Paused automatic brightness adjustment",
+                        self.output_name()
+                    ),
+                }
+            }
+            CommandAction::Resume => {
+                self.set_paused(None);
+                log::debug!(
+                    "[{}] Resumed automatic brightness adjustment",
+                    self.output_name()
+                );
+            }
+            CommandAction::Toggle => {
+                if self.is_paused() {
+                    self.set_paused(None);
+                } else {
+                    self.set_paused(Some(None));
+                }
+                log::debug!(
+                    "[{}] Toggled automatic brightness adjustment to {}",
+                    self.output_name(),
+                    if self.is_paused() { "paused" } else { "active" }
+                );
+            }
+        }
+        Ok(self
+            .brightness
+            .percent(result.or(self.current).unwrap_or(self.brightness.min())))
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused_until.is_some()
+    }
+
+    fn set_paused(&mut self, paused_until: Option<Option<Instant>>) {
+        let was_paused = self.is_paused();
+        self.paused_until = paused_until;
+        if let Some(paused) = &self.paused {
+            paused.store(self.is_paused(), Ordering::Relaxed);
+        }
+        if was_paused && !self.is_paused() {
+            self.resuming = true;
+            while self.prediction_rx.try_recv().is_ok() {}
+        }
+        self.target = None;
+        if let Some((status, output)) = &self.status {
+            status.set_paused(output, self.is_paused());
+        }
+    }
+
+    fn expire_pause(&mut self) {
+        if self
+            .paused_until
+            .flatten()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.set_paused(None);
+            log::debug!(
+                "[{}] Timed pause expired; resumed automatic brightness adjustment",
+                self.output_name()
+            );
+        }
+    }
+
+    fn output_name(&self) -> &str {
+        self.status
+            .as_ref()
+            .map_or("unknown", |(_, output)| output.as_str())
     }
 
     fn update_target(&mut self, desired: u64) {
@@ -351,6 +567,63 @@ mod tests {
 
         assert_eq!(Some(0), controller.current);
         assert!(is_brightness_spent(&controller.brightness));
+    }
+
+    #[apply(test!)]
+    async fn cli_set_discards_pending_prediction() -> Result<()> {
+        let (mut controller, prediction_tx, user_rx) = setup(brightness_mock(vec![], vec![60]));
+        controller.current = Some(50);
+        prediction_tx.send(40).await?;
+
+        controller
+            .execute(CommandAction::Set(crate::control::Adjustment {
+                percent: 60,
+                relative: false,
+                increase: true,
+            }))
+            .await?;
+
+        assert!(controller.prediction_rx.is_empty());
+        assert_eq!(60, user_rx.try_recv()?);
+        assert_eq!(Some(60), controller.current);
+        Ok(())
+    }
+
+    #[apply(test!)]
+    async fn resumes_from_current_brightness_without_learning_it() -> Result<()> {
+        let (mut controller, _, user_rx) = setup(brightness_mock(vec![50, 60], vec![60]));
+        controller.current = Some(50);
+        controller.set_paused(Some(None));
+
+        controller
+            .execute(CommandAction::Set(crate::control::Adjustment {
+                percent: 60,
+                relative: false,
+                increase: true,
+            }))
+            .await?;
+
+        assert_eq!(Some(50), controller.current);
+        assert!(user_rx.is_empty());
+
+        controller.set_paused(None);
+        controller.step().await;
+
+        assert_eq!(Some(60), controller.current);
+        assert!(user_rx.is_empty());
+        Ok(())
+    }
+
+    #[apply(test!)]
+    async fn rejects_unrepresentable_pause_duration() {
+        let (mut controller, _, _) = setup(brightness_mock(vec![], vec![]));
+        controller.current = Some(50);
+
+        assert!(controller
+            .execute(CommandAction::Pause(Some(Duration::MAX)))
+            .await
+            .is_err());
+        assert!(!controller.is_paused());
     }
 
     #[test]

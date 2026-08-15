@@ -20,6 +20,7 @@ impl Capturer {
         controller: crate::predictor::Controller,
         vulkan_device: Option<&str>,
         active: Arc<AtomicBool>,
+        status: crate::control::Hub,
     ) {
         match self {
             Capturer::Auto => {
@@ -28,6 +29,7 @@ impl Capturer {
                 smol::unblock(move || {
                     match wayland::Capturer::is_supported() {
                         Ok(true) => {
+                            status.set_capturer(&output, "wayland");
                             log::debug!("Auto capturer selected Wayland for '{output}'");
                             wayland::Capturer::new(crate::config::WaylandProtocol::Any).run(
                                 &output,
@@ -47,6 +49,7 @@ impl Capturer {
 
                     match pipewire::prepare(&output, crate::config::PipewireProtocol::Any) {
                         Ok(source) => {
+                            status.set_capturer(&output, "pipewire");
                             log::debug!("Auto capturer selected PipeWire for '{output}'");
                             pipewire::run_prepared(
                                 source,
@@ -56,6 +59,7 @@ impl Capturer {
                             );
                         }
                         Err(error) => {
+                            status.set_capturer(&output, "none");
                             log::warn!(
                                 "No supported screen capture protocol found for '{output}', using ALS only: {error:#}"
                             );
@@ -65,8 +69,12 @@ impl Capturer {
                 })
                 .await;
             }
-            Capturer::None(mut c) => c.run(output_name, controller, active).await,
+            Capturer::None(mut c) => {
+                status.set_capturer(output_name, "none");
+                c.run(output_name, controller, active).await
+            }
             Capturer::Pipewire(protocol) => {
+                status.set_capturer(output_name, "pipewire");
                 let output = output_name.to_string();
                 let vulkan_device = vulkan_device.map(str::to_string);
                 smol::unblock(move || {
@@ -81,6 +89,7 @@ impl Capturer {
                 .await;
             }
             Capturer::Wayland(mut c) => {
+                status.set_capturer(output_name, "wayland");
                 let output = output_name.to_string();
                 let vulkan_device = vulkan_device.map(str::to_string);
                 smol::unblock(move || c.run(&output, controller, vulkan_device.as_deref(), active))

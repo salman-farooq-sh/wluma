@@ -30,7 +30,6 @@ pub struct Backlight {
     current: Option<u64>,
     dbus: Option<Dbus>,
     has_write_permission: bool,
-    pending_dbus_write: bool,
     poll_brightness: bool,
 }
 
@@ -115,7 +114,6 @@ impl Backlight {
             current: None,
             dbus,
             has_write_permission,
-            pending_dbus_write: false,
             poll_brightness,
         })
     }
@@ -135,8 +133,7 @@ impl Backlight {
         match (self.inotify.read_events(&mut buffer), self.current) {
             (_, None) => update(self).await,
             (Ok(mut events), Some(cached)) => {
-                if self.pending_dbus_write || events.next().is_none() {
-                    self.pending_dbus_write = false;
+                if events.next().is_none() {
                     Ok(cached)
                 } else {
                     update(self).await
@@ -145,6 +142,14 @@ impl Backlight {
             (Err(err), Some(cached)) if err.kind() == ErrorKind::WouldBlock => Ok(cached),
             (Err(err), _) => Err(err.into()),
         }
+    }
+
+    pub fn min(&self) -> u64 {
+        self.min_brightness
+    }
+
+    pub fn max(&self) -> u64 {
+        self.max_brightness
     }
 
     pub fn transition_step_ms(&self) -> u64 {
@@ -173,7 +178,6 @@ impl Backlight {
             dbus.connection
                 .send(message)
                 .map_err(|_| anyhow!("Unable to send brightness change message via dbus"))?;
-            self.pending_dbus_write = true;
         } else {
             Err(std::io::Error::from(ErrorKind::PermissionDenied))?
         }

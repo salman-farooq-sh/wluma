@@ -65,6 +65,17 @@ impl Als {
         }
     }
 
+    pub async fn kind(&self) -> &'static str {
+        match self {
+            Self::Auto(als) => als.kind().await,
+            Self::External(_) => "external",
+            Self::Iio(als) => als.backend_name(),
+            Self::Webcam(_) => "webcam",
+            Self::Time(_) => "time",
+            Self::None(_) => "none",
+        }
+    }
+
     pub fn poll_interval(&self) -> Duration {
         match self {
             Self::Auto(als) => als.poll_interval(),

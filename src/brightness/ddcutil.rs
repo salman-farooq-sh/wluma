@@ -97,6 +97,14 @@ impl DdcUtil {
         }
     }
 
+    pub fn min(&self) -> u64 {
+        self.min_brightness
+    }
+
+    pub fn max(&self) -> u64 {
+        self.max_brightness
+    }
+
     pub fn waiting_sleep_ms(&self) -> u64 {
         match &self.backend {
             Backend::Direct(_) => DDC_DIRECT_WAITING_SLEEP_MS,
