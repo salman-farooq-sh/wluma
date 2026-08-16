@@ -1,66 +1,146 @@
 use super::data::Entry;
-use itertools::Itertools;
+use crate::als::Scale;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub mod adaptive;
 pub mod manual;
 
-const INITIAL_TIMEOUT_SECS: u64 = 15;
-const PENDING_COOLDOWN_RESET: u8 = 15;
-const NEXT_ALS_COOLDOWN_RESET: u8 = 15;
+const INITIAL_TIMEOUT: Duration = Duration::from_secs(15);
+const PENDING_COOLDOWN: Duration = Duration::from_millis(1500);
+const LUMA_SCALE: f64 = 20.0;
+const MAX_DISTANCE: f64 = 5.0;
+
+#[derive(Default)]
+struct Cooldown {
+    until: Option<Instant>,
+}
+
+impl Cooldown {
+    fn reset(&mut self, duration: Duration) {
+        self.until = Some(Instant::now() + duration);
+    }
+
+    fn is_active(&self) -> bool {
+        self.until.is_some_and(|until| Instant::now() < until)
+    }
+
+    fn clear(&mut self) {
+        self.until = None;
+    }
+
+    #[cfg(test)]
+    fn finish(&mut self) {
+        self.until = Some(Instant::now());
+    }
+}
 
 #[allow(clippy::large_enum_variant)]
-pub enum Controller {
+enum Inner {
     Adaptive(adaptive::Controller),
     Manual(manual::Controller),
 }
 
+pub struct Controller {
+    inner: Inner,
+    status: Option<(crate::control::Hub, String)>,
+    paused: Option<Arc<AtomicBool>>,
+}
+
 impl Controller {
+    pub fn adaptive(controller: adaptive::Controller) -> Self {
+        Self {
+            inner: Inner::Adaptive(controller),
+            status: None,
+            paused: None,
+        }
+    }
+
+    pub fn manual(controller: manual::Controller) -> Self {
+        Self {
+            inner: Inner::Manual(controller),
+            status: None,
+            paused: None,
+        }
+    }
+
+    pub fn with_status(
+        mut self,
+        status: crate::control::Hub,
+        output: String,
+        paused: Arc<AtomicBool>,
+    ) -> Self {
+        self.status = Some((status, output));
+        self.paused = Some(paused);
+        self
+    }
+
     pub async fn adjust(&mut self, luma: u8) {
-        match self {
-            Self::Adaptive(c) => c.adjust(luma).await,
-            Self::Manual(c) => c.adjust(luma).await,
+        if self
+            .paused
+            .as_ref()
+            .is_some_and(|paused| paused.load(Ordering::Relaxed))
+        {
+            return;
+        }
+        if let Some((status, output)) = &self.status {
+            status.set_luma(output, luma);
+        }
+        match &mut self.inner {
+            Inner::Adaptive(c) => c.adjust(luma).await,
+            Inner::Manual(c) => c.adjust(luma).await,
         }
     }
 }
 
-fn interpolate(entries: &[Entry], lux: &str, luma: u8) -> Option<u64> {
+fn distance(scale: Scale, als: u64, luma: u8, entry: &Entry) -> f64 {
+    let als_distance = scale.coordinate(als) - scale.coordinate(entry.als);
+    let luma_distance = (luma as f64 - entry.luma as f64) / LUMA_SCALE;
+    als_distance.hypot(luma_distance)
+}
+
+fn interpolate_raw(entries: &[Entry], scale: Scale, als: u64, luma: u8) -> Option<f64> {
     let points = entries
         .iter()
-        .filter(|e| e.lux == lux)
-        .map(|entry| {
-            let distance = (luma as f64 - entry.luma as f64).abs();
-            (entry.brightness as f64, distance)
+        .filter_map(|entry| {
+            let distance = distance(scale, als, luma, entry);
+            (distance <= MAX_DISTANCE).then_some((entry.brightness as f64, distance))
         })
-        .collect_vec();
-
-    if points.is_empty() {
+        .collect::<Vec<_>>();
+    if let Some((brightness, _)) = points.iter().find(|(_, distance)| *distance == 0.0) {
+        return Some(*brightness);
+    }
+    let total_weight = points
+        .iter()
+        .map(|(_, distance)| 1.0 / distance.powi(2))
+        .sum::<f64>();
+    if total_weight == 0.0 {
         return None;
     }
-
-    let points = points
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let other_distances: f64 = points[0..i]
-                .iter()
-                .chain(&points[i + 1..])
-                .map(|p| p.1)
-                .product();
-            (p.0, p.1, other_distances)
-        })
-        .collect_vec();
-
-    let distance_denominator: f64 = points
-        .iter()
-        .map(|p| p.1)
-        .combinations(points.len() - 1)
-        .map(|c| c.iter().product::<f64>())
-        .sum();
-
     let prediction = points
         .iter()
-        .map(|p| p.0 * p.2 / distance_denominator)
-        .sum::<f64>() as u64;
-
+        .map(|(brightness, distance)| brightness / distance.powi(2) / total_weight)
+        .sum::<f64>();
     Some(prediction)
+}
+
+fn interpolate(entries: &[Entry], scale: Scale, als: u64, luma: u8) -> Option<u64> {
+    interpolate_raw(entries, scale, als, luma).map(|prediction| prediction.round() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interpolation_rounds_to_nearest_brightness() {
+        let entries = vec![
+            Entry::new(3, 0, 2),
+            Entry::new(18, 0, 1),
+            Entry::new(747, 0, 0),
+        ];
+
+        assert_eq!(interpolate(&entries, Scale::Lux, 5, 0), Some(2));
+    }
 }

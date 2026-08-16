@@ -20,19 +20,38 @@ impl fmt::Display for WaylandProtocol {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum PipewireProtocol {
+    Any,
+    Portal,
+    Kwin,
+    Mutter,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Capturer {
+    Auto,
     Wayland(WaylandProtocol),
+    Pipewire(PipewireProtocol),
     None,
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
 pub enum Als {
-    Iio {
+    Auto {
+        thresholds: HashMap<u64, String>,
+    },
+    External {
         path: String,
+        scale: crate::als::Scale,
+        thresholds: HashMap<u64, String>,
+    },
+    Iio {
+        path: Option<String>,
         thresholds: HashMap<u64, String>,
     },
     Time {
+        levels: HashMap<u64, u64>,
         thresholds: HashMap<u64, String>,
     },
     Webcam {
@@ -42,40 +61,149 @@ pub enum Als {
     None,
 }
 
-#[derive(Debug, Clone)]
-pub enum Predictor {
-    Adaptive,
-    Manual {
-        thresholds: HashMap<String, HashMap<u8, u64>>,
-    },
+impl fmt::Debug for Als {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Auto { .. } => f.debug_struct("Auto").finish(),
+            Self::External { path, scale, .. } => f
+                .debug_struct("External")
+                .field("path", path)
+                .field("scale", scale)
+                .finish(),
+            Self::Iio { path, .. } => f.debug_struct("Iio").field("path", path).finish(),
+            Self::Time { levels, .. } => f.debug_struct("Time").field("levels", levels).finish(),
+            Self::Webcam { video, .. } => f.debug_struct("Webcam").field("video", video).finish(),
+            Self::None => write!(f, "None"),
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualPoint {
+    pub als: u64,
+    pub luma: u8,
+    pub reduction: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Predictor {
+    Adaptive,
+    Manual { points: Vec<ManualPoint> },
+}
+
+#[derive(Clone, Default, PartialEq)]
+pub enum VulkanDevice {
+    #[default]
+    Auto,
+    Path(String),
+}
+
+impl VulkanDevice {
+    pub fn as_deref(&self) -> Option<&str> {
+        match self {
+            Self::Auto => None,
+            Self::Path(path) => Some(path),
+        }
+    }
+}
+
+impl From<Option<String>> for VulkanDevice {
+    fn from(path: Option<String>) -> Self {
+        path.map_or(Self::Auto, Self::Path)
+    }
+}
+
+impl fmt::Debug for VulkanDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => f.write_str("Auto"),
+            Self::Path(path) => path.fmt(f),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BacklightKind {
+    Display,
+    Keyboard,
+}
+
+#[derive(Clone, PartialEq)]
 pub struct BacklightOutput {
     pub name: String,
     pub path: String,
     pub capturer: Capturer,
+    pub vulkan_device: VulkanDevice,
     pub min_brightness: u64,
+    pub kind: BacklightKind,
     pub predictor: Predictor,
+    pub als_direction: crate::predictor::AlsDirection,
 }
 
-#[derive(Debug, Clone)]
+impl fmt::Debug for BacklightOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BacklightOutput")
+            .field("name", &self.name)
+            .field("path", &self.path)
+            .field("capturer", &self.capturer)
+            .field("vulkan_device", &self.vulkan_device)
+            .field("min_brightness", &self.min_brightness)
+            .field("kind", &self.kind)
+            .field("predictor", &self.predictor)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct DdcUtilOutput {
     pub name: String,
     pub identifier: String,
+    pub identifier_overridden: bool,
     pub capturer: Capturer,
+    pub vulkan_device: VulkanDevice,
     pub min_brightness: u64,
     pub predictor: Predictor,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Output {
     Backlight(BacklightOutput),
     DdcUtil(DdcUtilOutput),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdleProfile {
+    pub enabled: bool,
+    pub timeout: u64,
+    pub brightness: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Idle {
+    pub ac: IdleProfile,
+    pub battery: IdleProfile,
+}
+
 #[derive(Debug)]
 pub struct Config {
     pub als: Als,
+    pub idle: Option<Idle>,
     pub output: Vec<Output>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VulkanDevice;
+
+    #[test]
+    fn formats_automatic_vulkan_device_for_config_dump() {
+        assert_eq!(format!("{:?}", VulkanDevice::Auto), "Auto");
+        assert_eq!(
+            format!(
+                "{:?}",
+                VulkanDevice::Path("/dev/dri/renderD128".to_string())
+            ),
+            "\"/dev/dri/renderD128\""
+        );
+    }
 }

@@ -1,20 +1,43 @@
-use futures_util::stream::{self, StreamExt};
 use macro_rules_attribute::apply;
 use smol::channel;
 
 mod als;
 mod brightness;
 mod channel_ext;
+mod cli;
 mod config;
+mod control;
 mod device_file;
 mod frame;
+mod idle;
 mod predictor;
+mod runtime;
+mod state;
 
 /// Current app version (determined at compile-time).
 pub const VERSION: &str = env!("WLUMA_VERSION");
 
 #[apply(smol_macros::main!)]
 async fn main() {
+    match cli::parse() {
+        Ok(cli::Mode::Daemon) => {}
+        Ok(cli::Mode::Command { request, stream }) => {
+            if let Err(error) = control::send(&request, stream).await {
+                eprintln!("wluma: {error:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Ok(cli::Mode::Print(value)) => {
+            println!("{value}");
+            return;
+        }
+        Err(error) => {
+            eprintln!("wluma: {error}");
+            std::process::exit(2);
+        }
+    }
+
     let panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         panic_hook(panic_info);
@@ -28,132 +51,127 @@ async fn main() {
 
     log::debug!("== wluma v{} ==", VERSION);
 
+    let _instance_lock = control::InstanceLock::acquire()
+        .unwrap_or_else(|error| panic!("Unable to acquire daemon lock: {error:#}"));
+
+    match state::migrate() {
+        Ok(true) => log::info!(
+            "Learned data has been migrated from $XDG_DATA_HOME/wluma to $XDG_STATE_HOME/wluma."
+        ),
+        Ok(false) => {}
+        Err(error) => panic!("Unable to migrate data files to the XDG state directory: {error:#}"),
+    }
+
     let config = match config::load() {
         Ok(config) => config,
-        Err(err) => panic!("Unable to load config: {}", err),
+        Err(error) => panic!("Unable to load config: {error}"),
     };
 
     log::debug!("Using {:#?}", config);
 
-    let (mut tasks, als_txs) = stream::iter(config.output.clone())
-        .fold(
-            (Vec::new(), Vec::new()),
-            |(mut tasks, mut als_txs), output| async move {
-                let output_clone = output.clone();
+    let als_kind = match &config.als {
+        config::Als::Auto { .. } => "auto",
+        config::Als::External { .. } => "external",
+        config::Als::Iio { .. } => "iio",
+        config::Als::Time { .. } => "time",
+        config::Als::Webcam { .. } => "webcam",
+        config::Als::None => "none",
+    };
+    let status = control::Hub::new(als_kind);
 
-                let (als_tx, als_rx) = channel::bounded(128);
-                let (user_tx, user_rx) = channel::bounded(128);
-                let (prediction_tx, prediction_rx) = channel::bounded(128);
+    let (als_scale, legacy_thresholds) = match &config.als {
+        config::Als::Auto { thresholds } | config::Als::Iio { thresholds, .. } => {
+            (als::Scale::Lux, thresholds.clone())
+        }
+        config::Als::External {
+            scale, thresholds, ..
+        } => (*scale, thresholds.clone()),
+        config::Als::Webcam { thresholds, .. } | config::Als::Time { thresholds, .. } => {
+            (als::Scale::Linear, thresholds.clone())
+        }
+        config::Als::None => (als::Scale::Linear, Default::default()),
+    };
 
-                let (output_name, output_capturer) = match output_clone.clone() {
-                    config::Output::Backlight(cfg) => (cfg.name, cfg.capturer),
-                    config::Output::DdcUtil(cfg) => (cfg.name, cfg.capturer),
-                };
-
-                let brightness = match output {
-                    config::Output::Backlight(cfg) => {
-                        brightness::Backlight::new(&cfg.path, cfg.min_brightness)
-                            .await
-                            .map(brightness::Brightness::Backlight)
-                    }
-                    config::Output::DdcUtil(cfg) => {
-                        brightness::DdcUtil::new(&cfg.identifier, cfg.min_brightness)
-                            .map(brightness::Brightness::DdcUtil)
-                    }
-                };
-
-                match brightness {
-                    Ok(b) => {
-                        tasks.push(smol::spawn(async {
-                            brightness::Controller::new(b, user_tx, prediction_rx)
-                                .run()
-                                .await;
-                        }));
-
-                        let predictor = match output_clone.clone() {
-                            config::Output::Backlight(backlight_output) => {
-                                backlight_output.predictor
-                            }
-                            config::Output::DdcUtil(ddcutil_output) => ddcutil_output.predictor,
-                        };
-
-                        tasks.push(smol::spawn(async move {
-                            let frame_capturer: frame::capturer::Capturer = match output_capturer {
-                                config::Capturer::Wayland(protocol) => {
-                                    frame::capturer::Capturer::Wayland(
-                                        frame::capturer::wayland::Capturer::new(protocol),
-                                    )
-                                }
-                                config::Capturer::None => {
-                                    frame::capturer::Capturer::None(Default::default())
-                                }
-                            };
-
-                            let controller = match predictor {
-                                config::Predictor::Manual { thresholds } => {
-                                    predictor::Controller::Manual(
-                                        predictor::controller::manual::Controller::new(
-                                            prediction_tx,
-                                            user_rx,
-                                            als_rx,
-                                            thresholds,
-                                            &output_name,
-                                        ),
-                                    )
-                                }
-                                config::Predictor::Adaptive => predictor::Controller::Adaptive(
-                                    predictor::controller::adaptive::Controller::new(
-                                        prediction_tx,
-                                        user_rx,
-                                        als_rx,
-                                        true,
-                                        &output_name,
-                                    ),
-                                ),
-                            };
-
-                            frame_capturer.run(&output_name, controller).await;
-                        }));
-
-                        als_txs.push(als_tx);
-                    }
-                    Err(err) => {
-                        log::warn!(
-                            "Skipping '{}' as it might be disconnected: {}",
-                            output_name,
-                            err
-                        );
-                    }
-                }
-
-                (tasks, als_txs)
-            },
-        )
-        .await;
-
-    let als: als::Als = match config.als {
-        config::Als::Iio { path, thresholds } => als::Als::Iio(
-            als::iio::Als::new(&path, thresholds)
+    let idle_config = config.idle;
+    if let Some(idle) = idle_config {
+        status.set_idle_profile("ac", idle.ac.enabled, idle.ac.timeout, idle.ac.brightness);
+    }
+    let mut webcam_task = None;
+    let source = match config.als {
+        config::Als::Auto { .. } => als::Als::Auto(Default::default()),
+        config::Als::External { path, scale, .. } => {
+            als::Als::External(als::external::Als::new(path, scale))
+        }
+        config::Als::Iio { path, .. } => als::Als::Iio(
+            als::iio::Als::new(path.as_deref())
                 .await
-                .expect("Unable to initialize ALS IIO sensor"),
+                .expect("Unable to initialize ambient light sensor"),
         ),
-        config::Als::Time { thresholds } => als::Als::Time(als::time::Als::new(thresholds)),
-        config::Als::Webcam { video, thresholds } => als::Als::Webcam({
+        config::Als::Time { levels, .. } => als::Als::Time(
+            als::time::Als::new(levels).expect("Unable to initialize time-based ambient light"),
+        ),
+        config::Als::Webcam { video, .. } => als::Als::Webcam({
             let (webcam_tx, webcam_rx) = channel::bounded(128);
             // TODO: make async
-            tasks.push(smol::unblock(move || {
+            webcam_task = Some(smol::unblock(move || {
                 als::webcam::Webcam::new(webcam_tx, video).run();
             }));
-            als::webcam::Als::new(webcam_rx, thresholds)
+            als::webcam::Als::new(webcam_rx)
         }),
         config::Als::None => als::Als::None(Default::default()),
     };
 
-    tasks.push(smol::spawn(async {
-        als::controller::Controller::new(als, als_txs).run().await;
-    }));
+    let (registration_tx, registration_rx) = channel::unbounded();
+    let als_status = status.clone();
+    let als_task = smol::spawn(async move {
+        als::controller::Controller::new(source, registration_rx)
+            .with_status(als_status)
+            .run()
+            .await;
+    });
+
+    let (idle_task, idle_rx) = if let Some(idle_config) = idle_config {
+        let (idle_tx, idle_rx) = channel::unbounded();
+        let ac_timeout = idle_config
+            .ac
+            .enabled
+            .then(|| std::time::Duration::from_secs(idle_config.ac.timeout));
+        let battery_timeout = idle_config
+            .battery
+            .enabled
+            .then(|| std::time::Duration::from_secs(idle_config.battery.timeout));
+        (
+            Some(smol::unblock(move || {
+                idle::run(ac_timeout, battery_timeout, idle_tx)
+            })),
+            Some(idle_rx),
+        )
+    } else {
+        (None, None)
+    };
+
+    let (control_tx, control_rx) = channel::unbounded();
+    let control_status = status.clone();
+    let control_task = smol::spawn(async move {
+        if let Err(error) = control::serve(control_status, control_tx).await {
+            panic!("Unable to start control socket: {error:#}");
+        }
+    });
 
     log::info!("Continue adjusting brightness and wluma will learn your preference over time.");
 
-    futures_util::future::join_all(tasks).await;
+    let mut runtime = runtime::Runtime::new(
+        config.output,
+        als_scale,
+        legacy_thresholds,
+        registration_tx,
+        control_rx,
+        status,
+        idle_config.zip(idle_rx),
+    );
+    runtime.run().await;
+    drop(control_task);
+    drop(als_task);
+    drop(idle_task);
+    drop(webcam_task);
 }

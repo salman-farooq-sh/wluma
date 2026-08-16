@@ -18,6 +18,8 @@ const DDC_CLI_WAITING_SLEEP_MS: u64 = 800;
 const DDC_CLI_TRANSITION_STEP_MS: u64 = 100;
 const DDC_DIRECT_RETRIES: usize = 3;
 const DDC_DIRECT_RETRY_SLEEP_MS: u64 = 40;
+const DDC_INITIALIZATION_ATTEMPTS: usize = 6;
+const DDC_INITIALIZATION_RETRY_SLEEP_MS: u64 = 1000;
 const DDC_CLI_RETRIES: usize = 3;
 const DDC_CLI_RETRY_SLEEP_MS: u64 = 150;
 
@@ -38,7 +40,7 @@ impl DdcUtil {
         let direct_error = match find_display_by_identifier(identifier, true)
             .or_else(|| find_display_by_identifier(identifier, false))
         {
-            Some(mut display) => match get_max_brightness_with_retry(&mut display) {
+            Some(mut display) => match initialize_direct(&mut display) {
                 Ok(max_brightness) => {
                     return Ok(Self {
                         identifier: identifier.to_string(),
@@ -93,6 +95,14 @@ impl DdcUtil {
             Err(err) if self.switch_to_cli_locked(&err)? => self.set_locked(value),
             Err(err) => Err(err),
         }
+    }
+
+    pub fn min(&self) -> u64 {
+        self.min_brightness
+    }
+
+    pub fn max(&self) -> u64 {
+        self.max_brightness
     }
 
     pub fn waiting_sleep_ms(&self) -> u64 {
@@ -178,8 +188,21 @@ fn get_max_brightness(display: &mut Display) -> Result<u64> {
         .maximum() as u64)
 }
 
-fn get_max_brightness_with_retry(display: &mut Display) -> Result<u64> {
-    retry_ddc("read max brightness", || get_max_brightness(display))
+fn initialize_direct(display: &mut Display) -> Result<u64> {
+    for attempt in 1..=DDC_INITIALIZATION_ATTEMPTS {
+        match get_max_brightness(display) {
+            Ok(max_brightness) => return Ok(max_brightness),
+            Err(error) if attempt < DDC_INITIALIZATION_ATTEMPTS => {
+                log::debug!(
+                    "Unable to initialize direct DDC (attempt {attempt}/{DDC_INITIALIZATION_ATTEMPTS}): {error:?}"
+                );
+                thread::sleep(Duration::from_millis(DDC_INITIALIZATION_RETRY_SLEEP_MS));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("initialization retry loop always returns before falling through")
 }
 
 fn get_brightness_with_retry(display: &mut Display) -> Result<u64> {
@@ -328,7 +351,7 @@ fn run_ddcutil(args: &[&str]) -> Result<String> {
 
 fn find_ddcutil_bus_by_identifier(identifier: &str) -> Result<Option<u32>> {
     let output = Command::new("ddcutil")
-        .args(["detect", "--terse"])
+        .arg("detect")
         .output()
         .context("Unable to execute ddcutil detect")?;
 
@@ -342,30 +365,40 @@ fn find_ddcutil_bus_by_identifier(identifier: &str) -> Result<Option<u32>> {
     Ok(
         parse_ddcutil_detect_output(&String::from_utf8_lossy(&output.stdout))?
             .into_iter()
-            .find_map(|display| display.monitor.contains(identifier).then_some(display.bus)),
+            .find_map(|display| display.matches(identifier).then_some(display.bus)),
     )
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct CliDisplay {
     bus: u32,
-    monitor: String,
+    identifiers: String,
+}
+
+impl CliDisplay {
+    fn matches(&self, identifier: &str) -> bool {
+        self.identifiers.contains(identifier)
+    }
 }
 
 fn parse_ddcutil_detect_output(output: &str) -> Result<Vec<CliDisplay>> {
     let mut displays = Vec::new();
     let mut current_bus = None;
-    let mut current_monitor = None;
+    let mut current_identifiers = Vec::new();
     let mut current_valid = true;
 
     for line in output.lines() {
         let line = line.trim();
 
-        if line.is_empty() || line.starts_with("Display ") {
+        if line.is_empty() {
+            continue;
+        }
+
+        if line.starts_with("Display ") {
             push_cli_display(
                 &mut displays,
                 &mut current_bus,
-                &mut current_monitor,
+                &mut current_identifiers,
                 current_valid,
             );
             current_valid = true;
@@ -376,7 +409,7 @@ fn parse_ddcutil_detect_output(output: &str) -> Result<Vec<CliDisplay>> {
             push_cli_display(
                 &mut displays,
                 &mut current_bus,
-                &mut current_monitor,
+                &mut current_identifiers,
                 current_valid,
             );
             current_valid = false;
@@ -388,15 +421,24 @@ fn parse_ddcutil_detect_output(output: &str) -> Result<Vec<CliDisplay>> {
             continue;
         }
 
-        if let Some(monitor) = line.strip_prefix("Monitor:") {
-            current_monitor = Some(monitor.trim().to_string());
+        for prefix in [
+            "Monitor:",
+            "Mfg id:",
+            "Model:",
+            "Serial number:",
+            "Binary serial number:",
+        ] {
+            if let Some(value) = line.strip_prefix(prefix) {
+                current_identifiers.push(value.trim().to_string());
+                break;
+            }
         }
     }
 
     push_cli_display(
         &mut displays,
         &mut current_bus,
-        &mut current_monitor,
+        &mut current_identifiers,
         current_valid,
     );
     Ok(displays)
@@ -405,13 +447,14 @@ fn parse_ddcutil_detect_output(output: &str) -> Result<Vec<CliDisplay>> {
 fn push_cli_display(
     displays: &mut Vec<CliDisplay>,
     current_bus: &mut Option<u32>,
-    current_monitor: &mut Option<String>,
+    current_identifiers: &mut Vec<String>,
     current_valid: bool,
 ) {
-    let display = current_bus.take().zip(current_monitor.take());
+    let bus = current_bus.take();
+    let identifiers = std::mem::take(current_identifiers).join(" ");
 
-    if let (true, Some((bus, monitor))) = (current_valid, display) {
-        displays.push(CliDisplay { bus, monitor });
+    if let (true, Some(bus), false) = (current_valid, bus, identifiers.is_empty()) {
+        displays.push(CliDisplay { bus, identifiers });
     }
 }
 
@@ -464,10 +507,15 @@ fn find_display_by_identifier(identifier: &str, check_caps: bool) -> Option<Disp
             caps.ok().map(|_| {
                 let empty = "".to_string();
                 let merged = format!(
-                    "{} {} {}",
+                    "{} {} {} {}",
                     display.info.model_name.as_ref().unwrap_or(&empty),
                     display.info.serial_number.as_ref().unwrap_or(&empty),
-                    display.info.manufacturer_id.as_ref().unwrap_or(&empty)
+                    display.info.manufacturer_id.as_ref().unwrap_or(&empty),
+                    display
+                        .info
+                        .serial
+                        .map(binary_serial_identifiers)
+                        .unwrap_or_default()
                 );
                 (merged, display)
             })
@@ -495,9 +543,21 @@ fn find_display_by_identifier(identifier: &str, check_caps: bool) -> Option<Disp
     })
 }
 
+fn binary_serial_identifiers(value: u32) -> String {
+    format!("{} {:#010x}", value, value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_binary_serial_identifiers() {
+        assert_eq!(
+            binary_serial_identifiers(0x1234abcd),
+            "305441741 0x1234abcd"
+        );
+    }
 
     #[test]
     fn test_parse_ddcutil_detect_output() -> Result<()> {
@@ -510,16 +570,24 @@ Invalid display
 Display 1
    I2C bus:          /dev/i2c-12
    DRM connector:    card0-HDMI-A-3
-   Monitor:          GSM:LG ULTRAWIDE:504AZER5F964
+   EDID synopsis:
+      Mfg id:               GSM
+      Model:                LG ULTRAWIDE
+      Serial number:        504AZER5F964
+      Binary serial number: 305441741 (0x1234abcd)
 "#;
 
+        let displays = parse_ddcutil_detect_output(output)?;
         assert_eq!(
-            parse_ddcutil_detect_output(output)?,
+            displays,
             vec![CliDisplay {
                 bus: 12,
-                monitor: "GSM:LG ULTRAWIDE:504AZER5F964".to_string(),
+                identifiers: "GSM LG ULTRAWIDE 504AZER5F964 305441741 (0x1234abcd)".to_string(),
             }]
         );
+        assert!(displays[0].matches("0x1234abcd"));
+        assert!(displays[0].matches("305441741"));
+        assert!(displays[0].matches("504AZER5F964"));
 
         Ok(())
     }

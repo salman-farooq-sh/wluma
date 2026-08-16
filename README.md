@@ -4,16 +4,19 @@ A tool for Wayland compositors to automatically adjust screen brightness based o
 
 ## Supported screen capture protocols
 
-With default config, `wluma` will automatically detect which protocols are supported, and pick the most appropriate one. See "Configuration" section below for more information and how to force a specific protocol.
+With the default `capturer = "auto"`, `wluma` first looks for a supported Wayland capture protocol, then tries PipeWire, and falls back to using ambient light only if neither is available. See the "Configuration" section below for details.
 
 The list of supported protocols:
 
-- `ext-image-capture-source-v1` - the newest protocol that potentially is (or will be) supported by any modern Wayland desktop environment.
-  - At the time of writing, it's not supported by any compositor yet.
-  - requires `ext-image-capture-source-v1` and `linux-dmabuf-v1` protocol to be supported as well.
+- `ext-image-copy-capture-v1` - the newest protocol that potentially is (or will be) supported by any modern Wayland desktop environment.
+  - requires `ext-image-capture-source-v1` and `linux-dmabuf-v1` protocols to be supported as well.
 - `wlr-screencopy-unstable-v1` - supported by any `wlroots`-based compositors (e.g. `sway`), as well as Hyprland.
   - requires `linux-dmabuf-v1` protocol to be supported as well.
 - `wlr-export-dmabuf-unstable-v1` - supported by any `wlroots`-based compositors (e.g. `sway`).
+- PipeWire streams provided by:
+  - KWin's private screencast protocol.
+  - Mutter's private ScreenCast API.
+  - Generic ScreenCast portal.
 
 ## Idea
 
@@ -29,9 +32,11 @@ Simply launch `wluma` and continue adjusting your screen brightness as you usual
 
 `wluma` will not do anything on the first launch! You have to adjust the brightness by hand a few times, in different environment and/or with different screen contents, that way `wluma` will learn your preferences and only then it will begin to automatically change your screen brightness for you.
 
+Changing brightness, seeing status and controlling the running daemon can be also done through CLI commands, run `wluma help` to see all available options.
+
 ## Performance
 
-The app has minimal impact on system resources and battery life even though it is able to monitor screen contents several times a second. This is achieved by using Wayland protocols to get access to the screen contents and doing computations entirely on GPU using Vulkan API.
+The app has minimal impact on system resources and battery life even though it is able to monitor screen contents several times a second. This is achieved by importing DMA-BUF screen buffers and doing computations on GPU using Vulkan API.
 
 ## Installation
 
@@ -53,7 +58,7 @@ Use one of the available packages and methods below:
 
 [![CI](https://github.com/maximbaz/wluma/actions/workflows/ci.yml/badge.svg)](https://github.com/maximbaz/wluma/actions/workflows/ci.yml)
 
-If you want to build the app yourself, make sure you use latest stable Rust, otherwise you might get compilation errors! Using `rustup` is perhaps the easiest. Ubuntu needs the following dependencies: `sudo apt-get -y install v4l-utils libv4l-dev libudev-dev libvulkan-dev libdbus-1-dev`.
+If you want to build the app yourself, make sure you use latest stable Rust, otherwise you might get compilation errors! Using `rustup` is perhaps the easiest. Ubuntu needs the following dependencies: `sudo apt-get -y install v4l-utils libv4l-dev libudev-dev libvulkan-dev libdbus-1-dev libpipewire-0.3-dev`.
 
 Then simply run `cargo build --locked --release` and the binary will be placed into `./target/release/wluma`.
 
@@ -71,60 +76,134 @@ The `config.toml` in repository represents default config values. To change them
 
 ### ALS
 
-Choose whether to use a real IIO-based ambient light sensor (`[als.iio]`), a webcam-based simulation (`[als.webcam]`), a time-based simulation (`[als.time]`) or disable it altogether (`[als.none]`).
+When ALS configuration is omitted, wluma uses an external ALS whenever `$XDG_RUNTIME_DIR/wluma/als.sock` is a Unix socket, otherwise it uses an available IIO ambient light sensor or continues without one. This selection is updated while wluma is running as sources appear and disappear. For IIO it first tries `iio-sensor-proxy` over the system D-Bus and then direct IIO discovery under `/sys/bus/iio/devices`.
 
-Each of them contains a `thresholds` field, which comes with good default values. It is there to convert generally exponential lux values into a linear scale to improve the prediction algorithm in `wluma`. Keys are the raw values from ambient light sensor (maximal value depends on the implementation), values are arbitrary "profiles". `wluma` will predict the best screen brightness according to the data learned within the same ALS profile.
+Explicit `[als.external]`, `[als.iio]`, `[als.webcam]`, `[als.time]` and `[als.none]` sections override automatic selection. The IIO `path` enables direct polling from a different sysfs directory when `iio-sensor-proxy` is unavailable.
+
+```toml
+[als.iio]
+path = "/sys/bus/iio/devices"
+```
+
+An external ALS is a Unix stream socket server that sends one non-negative decimal value per line. It should send values as soon as they become available and at least once every two seconds, including when unchanged. The path defaults to `$XDG_RUNTIME_DIR/wluma/als.sock` and the scale defaults to `lux`:
+
+```toml
+[als.external]
+path = "/run/user/1000/home-assistant/als.sock"
+scale = "linear"
+```
+
+The `lux` scale accepts illuminance values without an upper bound. The `linear` scale accepts normalized values from 0 to 100. The socket is detected whether it exists before wluma starts or appears later.
+
+Webcam ALS reports perceived camera-frame lightness from 0 to 100. Time ALS uses a circular, linearly interpolated schedule of synthetic light levels:
+
+```toml
+[als.time]
+levels = { 0 = 0, 7 = 10, 9 = 40, 12 = 70, 16 = 50, 19 = 10, 21 = 0 }
+```
+
+The adaptive predictor stores numeric ALS readings and continuously interpolates between nearby learned conditions. IIO lux is mapped to a logarithmic coordinate, while webcam and synthetic time values are linear.
+
+### Idle dimming
+
+After two minutes of inactivity, wluma pauses automatic adjustment, dims displays to 30% of their current brightness and turns keyboard backlights off. These defaults can be changed globally or per power source:
+
+```toml
+[idle]
+enabled = true
+timeout = 120
+brightness = 30
+
+[idle.ac]
+timeout = 300
+
+[idle.battery]
+brightness = 20
+```
+
+Timeouts are in seconds. Omitted AC and battery settings inherit the global values; set `enabled = false` globally or in either profile to disable it. Wluma uses UPower to detect the current power source. When activity resumes, automatic adjustment continues with a fresh prediction rather than explicitly restoring the previous brightness.
+
+Idle detection uses `ext-idle-notify-v1`, which honors compositor idle inhibitors, with GNOME Mutter's IdleMonitor as a fallback. Disable other automatic idle dimming to avoid conflicts. On GNOME:
+
+```sh
+gsettings set org.gnome.settings-daemon.plugins.power idle-dim false
+```
 
 ### Displays
 
-Multiple outputs are supported, using `backlight` (common for internal laptop screens) and `ddcutil` (for external screens). DDC is known to often be problematic, always consider trying out [ddcci-driver-linux](https://gitlab.com/ddcci-driver-linux/ddcci-driver-linux) first if you can.
+The entire `output` section is optional. Wluma continuously discovers connected DRM outputs, associates internal panels with `/sys/class/backlight` devices and external monitors with DDC using their EDID, and automatically selects a screen capturer. Automatically discovered outputs and keyboards are started and stopped as they appear and disappear. DDC is known to often be problematic, so always consider trying [ddcci-driver-linux](https://gitlab.com/ddcci-driver-linux/ddcci-driver-linux) first if you can.
 
-The `name` field in the output config identifies the Wayland output, and is matched as a substring against descriptions containing model, manufacturer and serial number (like `eDP-1 'Sharp Corporation 0x14A8 0x00000000' (eDP-1)`), so you are free to put simply `eDP-1`, `HDMI-A-3`, or a unique model/serial substring. It is your responsibility to make sure that the values you use match **uniquely** to one output only.
+To override the capturer or predictor for a discovered output, use the detected brightness type and DRM connector name reported with `RUST_LOG=debug`:
 
-For `output.ddcutil`, if the identifier that works for brightness control is not the same substring that your Wayland compositor exposes for screen capture, set `identifier`. This is common for external DDC monitors: `name` should match the compositor output description such as `HDMI-A-3` or `LG ULTRAWIDE`, while `identifier` may need to be a serial number for DDC.
+```toml
+[[output.ddcutil]]
+name = "HDMI-A-3"
+capturer = "none"
+```
+
+Explicit `output.backlight` and `output.ddcutil` entries remain supported. The `path` of a backlight entry is optional when its `name` matches a discovered connector. Supplying a path or DDC identifier overrides the discovered value.
+
+The `name` field identifies the Wayland output and is matched as a substring against descriptions containing model, manufacturer and serial number (like `eDP-1 'Sharp Corporation 0x14A8 0x00000000' (eDP-1)`). Automatically discovered output names use the unambiguous DRM connector name.
+
+For `output.ddcutil`, if the identifier that works for brightness control is not the same substring that your Wayland compositor exposes for screen capture, set `identifier`. This is common for external DDC monitors: `name` should match the compositor output description such as `HDMI-A-3`, while `identifier` may need to be a serial number for DDC.
 
 _Tip:_ run `wluma` with `RUST_LOG=debug` to see how your outputs are being identified, so that you can choose an appropriate `name` and `identifier` configuration values.
 
-The `capturer` field will determine how screen contents will be captured. Currently supported values are `wayland` (works only on Wayland compositors that support protocols listed in the top) and `none` (ignores screen contents and predicts brightness only based on ALS). The value `wayland` will automatically choose the most appropriate protocol, but if you want to force a specific one, you can also use `ext-image-capture-source-v1`, `wlr-screencopy-unstable-v1` or `wlr-export-dmabuf-unstable-v1` as the value.
+The `capturer` field will determine how screen contents will be captured. Currently supported values are `auto`, `wayland`, `pipewire` and `none` (ignores screen contents and predicts brightness only based on ALS). The default value `auto` tries supported Wayland protocols first, then PipeWire sources, then falls back to `none`. The value `wayland` automatically chooses the most appropriate Wayland protocol, but you can force a specific one with `ext-image-copy-capture-v1`, `wlr-screencopy-unstable-v1` or `wlr-export-dmabuf-unstable-v1`. The value `pipewire` similarly automatically chooses the most appropriate protocol, and you can force a specific source with `zkde-screencast-unstable-v1`, `gnome-mutter-screencast` or `xdg-desktop-portal-screencast`.
 
-_Tip:_ run `wluma` with `RUST_LOG=debug` and `capturer="wayland"` to see which protocols are supported by your Wayland compositor, and which one `wluma` chooses to use.
+_Tip:_ run `wluma` with `RUST_LOG=debug` and `capturer="auto"` to see which protocols are supported and which capturer `wluma` chooses.
 
-#### Algorithm
+On multi-GPU systems, wluma automatically selects a Vulkan device. Set `vulkan_device` only if it selects the wrong GPU:
+
+```toml
+[[output.backlight]]
+name = "eDP-1"
+vulkan_device = "/dev/dri/renderD128"
+```
+
+Run `wluma` with `RUST_LOG=debug` and find the `Discovered Vulkan device` entry for the GPU you want to use. Set `vulkan_device` to its `DRM render device` path, such as `/dev/dri/renderD128`; do not use the `DRM primary device` path.
+
+When the ScreenCast portal is used, select the monitor matching the configured output on the first run. wluma asks the portal to persist this selection and stores its restore token in the XDG state directory, so supported portal backends can restore it without prompting after restart. A separate portal session and restore token are used for each configured output.
+
+### Keyboards
+
+Keyboard backlights are automatically discovered under `/sys/class/leds` when their LED device name contains `kbd_backlight`, which covers common Dell, ThinkPad and ASUS devices. They are logged with `RUST_LOG=debug`. Explicit `[[keyboard]]` entries remain available for devices that do not follow this naming convention, and an entry pointing to an automatically discovered path replaces rather than duplicates it.
+
+### Algorithm
 
 The default algorithm that `wluma` uses is called `adaptive`, which is when it learns from you as you continue adjusting brightness manually. It will eventually figure out patterns in how you tend to adjust brightness in dark and lit conditions and depending on what is currently being displayed on the screen, and will beging to do it automatically for you.
 
 If you instead want to preserve control over absolute brightness value, but let `wluma` only do relative adjustments, there is an alternative algorithm called `manual`. It can be useful if you feel like `wluma` is unable to learn the patterns, for example because you don't have a real ambient light sensor, and neither of the alternative ALS inputs are able to capture the real light conditions precisely enough.
 
-Here's how you enable the manual algorithm in the config:
+The manual predictor accepts points containing an ALS value, screen luma and brightness reduction percentage:
 
 ```toml
-[als.time]
-thresholds = { 0 = "night", 8 = "day", 18 = "night" }
-
 [[output.backlight]]
 name = "eDP-1"
-path = "/sys/class/backlight/intel_backlight"
-capturer = "wayland"
+
 [output.backlight.predictor.manual]
-thresholds.day = { 0 = 0, 100 = 10 }
-thresholds.night = { 0 = 0, 100 = 60 }
+[[output.backlight.predictor.manual.points]]
+als = 0
+luma = 0
+reduction = 0
+
+[[output.backlight.predictor.manual.points]]
+als = 0
+luma = 100
+reduction = 60
+
+[[output.backlight.predictor.manual.points]]
+als = 500
+luma = 0
+reduction = 0
+
+[[output.backlight.predictor.manual.points]]
+als = 500
+luma = 100
+reduction = 10
 ```
 
-In other words, you activate the predictor for a given `output` using `[output.backlight.predictor.manual]`, and then you define thresholds for each ALS condition using the following syntax:
-
-```
-thresholds.<als threshold name> = {<luma> = <brightness reduction percentage>}
-```
-
-- `luma` is the "whiteness" of your screen contents, measured in percentage, from `0` to `100`.
-- Current screen brightness (that you set manually) will be reduced by the corresponding `brightness reduction percentage` based on what is currently being displayed on the screen.
-- `als threshold name` is the custom name that you define in ALS thresholds. When using `[als.none]`, the `als threshold name` is `none`.
-- You can define as many entries within each threshold as you want (up to 100, for every single `luma` value). The algorithm will interpolate between the values you define.
-
-The example config above expresses the following intention:
-
-- During the day, the screen brightness will be reduced upmost by 10% of the value you set - fully black screen does not reduce the brightness at all, fully white screen reduces it by 10%, screen contents with "whiteness" of 70% will reduce the brightness by 7%, etc.
-- During the day, the screen brightness will be reduced upmost by 60% of the value you set - using the same logic as above.
+`luma` is the whiteness of the screen contents from 0 to 100. `reduction` is the percentage by which the current manually selected brightness is reduced. `als` uses lux for IIO, perceived lightness for webcam, configured synthetic level for time, and 0 for none. The algorithm continuously interpolates between nearby points.
 
 ## Run
 
@@ -146,7 +225,7 @@ This is a useful test to validate that wluma does indeed see the screen contents
 1. Make sure that **the entire screen** is covered with a single solid color, nothing else should be visible - not a status bar nor a notification, nothing else.
 1. Repeat for each of these colors: `black`, `white`, `red`, `green`, `blue`:
    1. Let the color be visible for a few seconds.
-   1. Quickly go back to the running `wluma` and check the `luma` value reported for that color: `Prediction: 252 (lux: none, luma: ---> 14 <---)`
+   1. Quickly go back to the running `wluma` and check the `luma` value reported for that color: `Prediction: 252 (als: 0, luma: ---> 14 <---)`
 1. Compare your values with the following expected results:
    ```
    black: 0
@@ -157,13 +236,6 @@ This is a useful test to validate that wluma does indeed see the screen contents
    ```
 
 If your results do not match, please open an issue and let's investigate!
-
-## Known issues (help wanted!)
-
-Help is wanted and much appreciated! If you want to implement some of these, feel free to open an issue and I'll provide more details and try to help you along the way.
-
-- Support for frames with custom DRM modifiers (e.g. multi-planar frames) is currently not implemented. This was [implemented in mesa](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/1466) and can finally be added to `wluma`. Until then, a workaround is to export `WLR_DRM_NO_MODIFIERS=1` before launching your wlroots-based compositor.
-- Plugging in a screen while `wluma` is running. Workaround: restart `wluma`.
 
 ## Relevant projects
 

@@ -3,9 +3,11 @@ use std::collections::HashMap;
 
 #[derive(Deserialize, Debug, Default)]
 pub enum Capturer {
+    #[default]
+    #[serde(rename = "auto")]
+    Auto,
     #[serde(rename = "wlroots")]
     Wlroots,
-    #[default]
     #[serde(rename = "wayland")]
     Wayland,
     #[serde(rename = "wlr-export-dmabuf-unstable-v1")]
@@ -14,23 +16,45 @@ pub enum Capturer {
     WlrScreencopyUnstableV1,
     #[serde(rename = "ext-image-copy-capture-v1")]
     ExtImageCopyCaptureV1,
+    #[serde(rename = "pipewire")]
+    Pipewire,
+    #[serde(rename = "xdg-desktop-portal-screencast")]
+    XdgDesktopPortalScreencast,
+    #[serde(rename = "zkde-screencast-unstable-v1")]
+    ZkdeScreencastUnstableV1,
+    #[serde(rename = "gnome-mutter-screencast")]
+    GnomeMutterScreencast,
     #[serde(rename = "none")]
     None,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AlsScale {
+    #[default]
+    Lux,
+    Linear,
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum Als {
+    External {
+        path: Option<String>,
+        #[serde(default)]
+        scale: AlsScale,
+    },
     Iio {
-        path: String,
-        thresholds: HashMap<String, String>,
+        path: Option<String>,
+        thresholds: Option<HashMap<String, String>>,
     },
     Time {
-        thresholds: HashMap<String, String>,
+        levels: Option<HashMap<String, u64>>,
+        thresholds: Option<HashMap<String, String>>,
     },
     Webcam {
         video: usize,
-        thresholds: HashMap<String, String>,
+        thresholds: Option<HashMap<String, String>>,
     },
     None,
 }
@@ -42,21 +66,31 @@ pub struct OutputByType {
     pub ddcutil: Vec<DdcUtilOutput>,
 }
 
+#[derive(Deserialize, Debug)]
+pub struct ManualPoint {
+    pub als: u64,
+    pub luma: u8,
+    pub reduction: u64,
+}
+
 #[derive(Deserialize, Debug, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Predictor {
     #[default]
     Adaptive,
     Manual {
-        thresholds: HashMap<String, HashMap<String, u64>>,
+        #[serde(default)]
+        points: Vec<ManualPoint>,
+        thresholds: Option<HashMap<String, HashMap<String, u64>>>,
     },
 }
 
 #[derive(Deserialize, Debug)]
 pub struct BacklightOutput {
     pub name: String,
-    pub path: String,
+    pub path: Option<String>,
     pub capturer: Option<Capturer>,
+    pub vulkan_device: Option<String>,
     pub predictor: Option<Predictor>,
 }
 
@@ -65,6 +99,7 @@ pub struct DdcUtilOutput {
     pub name: String,
     pub identifier: Option<String>,
     pub capturer: Option<Capturer>,
+    pub vulkan_device: Option<String>,
     pub predictor: Option<Predictor>,
 }
 
@@ -74,9 +109,40 @@ pub struct Keyboard {
     pub path: String,
 }
 
+#[derive(Deserialize, Debug, Default)]
+#[serde(default)]
+pub struct IdleProfile {
+    pub enabled: Option<bool>,
+    pub timeout: Option<u64>,
+    pub brightness: Option<u8>,
+}
+
 #[derive(Deserialize, Debug)]
+#[serde(default)]
+pub struct Idle {
+    pub enabled: bool,
+    pub timeout: u64,
+    pub brightness: u8,
+    pub ac: IdleProfile,
+    pub battery: IdleProfile,
+}
+
+impl Default for Idle {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout: 120,
+            brightness: 30,
+            ac: IdleProfile::default(),
+            battery: IdleProfile::default(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Default)]
 pub struct Config {
-    pub als: Als,
+    pub als: Option<Als>,
+    pub idle: Option<Idle>,
     #[serde(default)]
     pub output: OutputByType,
     #[serde(default)]

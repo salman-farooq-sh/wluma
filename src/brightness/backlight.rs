@@ -8,6 +8,15 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
+const TRANSITION_STEP_MS: u64 = 16;
+const BRIGHTNESS_STEPS: u64 = 1000;
+
+fn requires_polling(path: &Path) -> bool {
+    path.parent()
+        .and_then(Path::file_name)
+        .is_some_and(|subsystem| subsystem == "leds")
+}
+
 struct Dbus {
     connection: Connection,
     message: Message,
@@ -21,7 +30,7 @@ pub struct Backlight {
     current: Option<u64>,
     dbus: Option<Dbus>,
     has_write_permission: bool,
-    pending_dbus_write: bool,
+    poll_brightness: bool,
 }
 
 impl Backlight {
@@ -95,6 +104,8 @@ impl Backlight {
                 .add(&brightness_hw_changed_path, WatchMask::MODIFY)?;
         }
 
+        let poll_brightness = requires_polling(Path::new(path));
+
         Ok(Self {
             file,
             min_brightness,
@@ -103,7 +114,7 @@ impl Backlight {
             current: None,
             dbus,
             has_write_permission,
-            pending_dbus_write: false,
+            poll_brightness,
         })
     }
 
@@ -114,12 +125,15 @@ impl Backlight {
             Ok(value)
         }
 
+        if self.poll_brightness {
+            return update(self).await;
+        }
+
         let mut buffer = [0u8; 1024];
         match (self.inotify.read_events(&mut buffer), self.current) {
             (_, None) => update(self).await,
             (Ok(mut events), Some(cached)) => {
-                if self.pending_dbus_write || events.next().is_none() {
-                    self.pending_dbus_write = false;
+                if events.next().is_none() {
                     Ok(cached)
                 } else {
                     update(self).await
@@ -128,6 +142,25 @@ impl Backlight {
             (Err(err), Some(cached)) if err.kind() == ErrorKind::WouldBlock => Ok(cached),
             (Err(err), _) => Err(err.into()),
         }
+    }
+
+    pub fn min(&self) -> u64 {
+        self.min_brightness
+    }
+
+    pub fn max(&self) -> u64 {
+        self.max_brightness
+    }
+
+    pub fn transition_step_ms(&self) -> u64 {
+        TRANSITION_STEP_MS
+    }
+
+    pub fn change_threshold(&self) -> u64 {
+        self.max_brightness
+            .saturating_sub(self.min_brightness)
+            .div_ceil(BRIGHTNESS_STEPS)
+            .max(1)
     }
 
     pub async fn set(&mut self, value: u64) -> Result<u64> {
@@ -145,7 +178,6 @@ impl Backlight {
             dbus.connection
                 .send(message)
                 .map_err(|_| anyhow!("Unable to send brightness change message via dbus"))?;
-            self.pending_dbus_write = true;
         } else {
             Err(std::io::Error::from(ErrorKind::PermissionDenied))?
         }
@@ -159,5 +191,24 @@ impl Backlight {
             Err(err) => Err(err.into()),
             _ => Ok(value),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn led_brightness_requires_polling() {
+        assert!(requires_polling(Path::new(
+            "/sys/class/leds/dell::kbd_backlight"
+        )));
+    }
+
+    #[test]
+    fn display_brightness_uses_inotify() {
+        assert!(!requires_polling(Path::new(
+            "/sys/class/backlight/intel_backlight"
+        )));
     }
 }

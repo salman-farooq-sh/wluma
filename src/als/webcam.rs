@@ -4,7 +4,6 @@ use anyhow::{anyhow, Result};
 use itertools::Itertools;
 use smol::channel::{Receiver, Sender};
 use smol::lock::Mutex;
-use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 use v4l::buffer::Type;
@@ -13,8 +12,7 @@ use v4l::io::traits::CaptureStream;
 use v4l::video::Capture;
 use v4l::{Device, FourCC};
 
-const DEFAULT_LUX: u64 = 100;
-const WAITING_SLEEP_MS: u64 = 2000;
+const CAPTURE_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct Webcam {
     webcam_tx: Sender<u64>,
@@ -34,14 +32,14 @@ impl Webcam {
 
     fn step(&mut self) {
         if let Ok((rgbs, pixels)) = self.frame() {
-            let lux = compute_perceived_lightness_percent(&rgbs, false, pixels) as u64;
+            let lightness = compute_perceived_lightness_percent(&rgbs, false, pixels) as u64;
 
             self.webcam_tx
-                .send_blocking(lux) // TODO: async
-                .expect("Unable to send new webcam lux value, channel is dead");
+                .send_blocking(lightness) // TODO: async
+                .expect("Unable to send new webcam lightness value, channel is dead");
         };
 
-        thread::sleep(Duration::from_millis(WAITING_SLEEP_MS));
+        thread::sleep(CAPTURE_INTERVAL);
     }
 
     fn frame(&mut self) -> Result<(Vec<u8>, usize)> {
@@ -79,35 +77,34 @@ impl Webcam {
 
 pub struct Als {
     webcam_rx: Receiver<u64>,
-    thresholds: HashMap<u64, String>,
-    lux: Mutex<u64>,
+    lightness: Mutex<Option<u64>>,
 }
 
 impl Als {
-    pub fn new(webcam_rx: Receiver<u64>, thresholds: HashMap<u64, String>) -> Self {
+    pub fn new(webcam_rx: Receiver<u64>) -> Self {
         Self {
             webcam_rx,
-            thresholds,
-            lux: Mutex::new(DEFAULT_LUX),
+            lightness: Mutex::new(None),
         }
     }
 
-    pub async fn get(&self) -> Result<String> {
-        let raw = self.get_raw().await?;
-        let profile = super::find_profile(raw, &self.thresholds);
-
-        log::trace!("ALS (webcam): {} ({})", profile, raw);
-        Ok(profile)
+    pub async fn get(&self) -> Result<Option<u64>> {
+        let value = self.get_raw().await?;
+        if let Some(value) = value {
+            log::trace!("ALS (webcam): {value}");
+        }
+        Ok(value)
     }
 
-    async fn get_raw(&self) -> Result<u64> {
+    async fn get_raw(&self) -> Result<Option<u64>> {
+        let current = *self.lightness.lock_blocking();
         let new_value = self
             .webcam_rx
             .recv_maybe_last()
             .await
             .expect("webcam_rx closed unexpectedly")
-            .unwrap_or(*self.lux.lock_blocking());
-        *self.lux.lock_blocking() = new_value;
+            .or(current);
+        *self.lightness.lock_blocking() = new_value;
         Ok(new_value)
     }
 }
@@ -122,15 +119,15 @@ mod tests {
 
     async fn setup() -> (Als, Sender<u64>) {
         let (webcam_tx, webcam_rx) = channel::bounded(128);
-        let als = Als::new(webcam_rx, HashMap::default());
+        let als = Als::new(webcam_rx);
         (als, webcam_tx)
     }
 
     #[apply(test!)]
-    async fn test_get_raw_returns_default_value_when_no_data_from_webcam() -> Result<()> {
+    async fn test_get_raw_returns_none_when_no_data_from_webcam() -> Result<()> {
         let (als, _) = setup().await;
 
-        assert_eq!(DEFAULT_LUX, als.get_raw().await?);
+        assert_eq!(None, als.get_raw().await?);
         Ok(())
     }
 
@@ -140,7 +137,7 @@ mod tests {
 
         webcam_tx.send(42).await?;
 
-        assert_eq!(42, als.get_raw().await?);
+        assert_eq!(Some(42), als.get_raw().await?);
         Ok(())
     }
 
@@ -152,7 +149,7 @@ mod tests {
         webcam_tx.send(43).await?;
         webcam_tx.send(44).await?;
 
-        assert_eq!(44, als.get_raw().await?);
+        assert_eq!(Some(44), als.get_raw().await?);
         Ok(())
     }
 
@@ -163,9 +160,9 @@ mod tests {
         webcam_tx.send(42).await?;
         webcam_tx.send(43).await?;
 
-        assert_eq!(43, als.get_raw().await?);
-        assert_eq!(43, als.get_raw().await?);
-        assert_eq!(43, als.get_raw().await?);
+        assert_eq!(Some(43), als.get_raw().await?);
+        assert_eq!(Some(43), als.get_raw().await?);
+        assert_eq!(Some(43), als.get_raw().await?);
         Ok(())
     }
 }

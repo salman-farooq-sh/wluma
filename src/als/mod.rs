@@ -1,40 +1,105 @@
 use anyhow::Result;
-use itertools::Itertools;
-use std::collections::HashMap;
+use std::time::Duration;
 
+pub mod auto;
 pub mod controller;
+pub mod external;
 pub mod iio;
 pub mod none;
+mod sensor_proxy;
 pub mod time;
 pub mod webcam;
 
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const LINEAR_COORDINATE_SCALE: f64 = 20.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scale {
+    Lux,
+    Linear,
+}
+
+impl Scale {
+    pub fn coordinate(self, value: u64) -> f64 {
+        match self {
+            Self::Lux => (value as f64 + 1.0).log10(),
+            Self::Linear => value as f64 / LINEAR_COORDINATE_SCALE,
+        }
+    }
+
+    pub fn value(self, coordinate: f64) -> u64 {
+        match self {
+            Self::Lux => (10.0_f64.powf(coordinate) - 1.0).round() as u64,
+            Self::Linear => (coordinate * LINEAR_COORDINATE_SCALE)
+                .round()
+                .clamp(0.0, 100.0) as u64,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reading {
+    pub value: u64,
+    pub stable: bool,
+}
+
 #[allow(clippy::large_enum_variant)]
 pub enum Als {
+    Auto(auto::Als),
     Webcam(webcam::Als),
+    External(external::Als),
     Iio(iio::Als),
     Time(time::Als),
     None(none::Als),
 }
 
 impl Als {
-    pub async fn get(&self) -> Result<String> {
+    pub async fn get(&self) -> Result<Option<u64>> {
         match self {
-            Als::Webcam(als) => als.get().await,
-            Als::Iio(als) => als.get().await,
-            Als::Time(als) => als.get().await,
-            Als::None(als) => als.get().await,
+            Self::Auto(als) => als.get().await,
+            Self::Webcam(als) => als.get().await,
+            Self::External(als) => als.get().await.map(Some),
+            Self::Iio(als) => als.get().await.map(Some),
+            Self::Time(als) => als.get().await.map(Some),
+            Self::None(als) => als.get().await.map(Some),
         }
     }
-}
 
-fn find_profile(raw: u64, thresholds: &HashMap<u64, String>) -> String {
-    thresholds
-        .iter()
-        .sorted_by_key(|(lux, _)| *lux)
-        .rev()
-        .find_or_last(|(lux, _)| raw >= **lux)
-        .map(|(_, profile)| profile.to_string())
-        .unwrap_or_else(|| panic!("Unable to find ALS profile for value '{}'", raw))
+    pub async fn kind(&self) -> &'static str {
+        match self {
+            Self::Auto(als) => als.kind().await,
+            Self::External(_) => "external",
+            Self::Iio(als) => als.backend_name(),
+            Self::Webcam(_) => "webcam",
+            Self::Time(_) => "time",
+            Self::None(_) => "none",
+        }
+    }
+
+    pub fn poll_interval(&self) -> Duration {
+        match self {
+            Self::Auto(als) => als.poll_interval(),
+            Self::External(als) => als.poll_interval(),
+            Self::Iio(als) => als.poll_interval(),
+            Self::Webcam(_) | Self::Time(_) | Self::None(_) => DEFAULT_POLL_INTERVAL,
+        }
+    }
+
+    pub fn scale(&self) -> Scale {
+        match self {
+            Self::Auto(_) => Scale::Lux,
+            Self::External(als) => als.scale(),
+            Self::Iio(_) => Scale::Lux,
+            Self::Webcam(_) | Self::Time(_) | Self::None(_) => Scale::Linear,
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        match self {
+            Self::Auto(als) => als.generation(),
+            _ => 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -42,47 +107,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_find_profile_base_cases() {
-        let thresholds = vec![(0, "dark"), (10, "dim"), (20, "bright")]
-            .into_iter()
-            .map(|(lux, profile)| (lux, profile.to_string()))
-            .collect();
-
-        assert_eq!("dark", find_profile(0, &thresholds));
-        assert_eq!("dark", find_profile(2, &thresholds));
-        assert_eq!("dim", find_profile(10, &thresholds));
-        assert_eq!("dim", find_profile(19, &thresholds));
-        assert_eq!("bright", find_profile(20, &thresholds));
-        assert_eq!("bright", find_profile(200, &thresholds));
+    fn lux_scale_spans_orders_of_magnitude() {
+        assert_eq!(0.0, Scale::Lux.coordinate(0));
+        assert!((Scale::Lux.coordinate(100_000) - 5.0).abs() < 0.001);
     }
 
     #[test]
-    fn test_find_profile_fallback_first() {
-        let thresholds = vec![(5, "dark"), (10, "dim"), (20, "bright")]
-            .into_iter()
-            .map(|(lux, profile)| (lux, profile.to_string()))
-            .collect();
-
-        assert_eq!("dark", find_profile(0, &thresholds));
-        assert_eq!("dark", find_profile(4, &thresholds));
-    }
-
-    #[test]
-    fn test_find_profile_is_constant_on_thresholds_with_one_value() {
-        let thresholds = vec![(5, "dark")]
-            .into_iter()
-            .map(|(lux, profile)| (lux, profile.to_string()))
-            .collect();
-
-        assert_eq!("dark", find_profile(0, &thresholds));
-        assert_eq!("dark", find_profile(4, &thresholds));
-        assert_eq!("dark", find_profile(5, &thresholds));
-        assert_eq!("dark", find_profile(9, &thresholds));
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_find_profile_panics_on_empty_thresholds() {
-        find_profile(10, &HashMap::default());
+    fn linear_scale_preserves_value() {
+        assert_eq!(2.1, Scale::Linear.coordinate(42));
+        assert_eq!(42, Scale::Linear.value(2.1));
+        assert_eq!(100, Scale::Linear.value(7.5));
     }
 }
